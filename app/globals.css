@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+/* PSA / American-inspired palette */
+@theme {
+  --color-psa-blue: #0078d2;       /* primary blue (AA/PSA style) */
+  --color-psa-red: #c8102e;        /* AA red accent */
+  --color-psa-navy: #001b3a;       /* deep nav bar / text accent */
+  --color-psa-bg: #f4f6fb;         /* light app background */
+}
+
+/* Global resets / defaults */
+html,
+body {
+  padding: 0;
+  margin: 0;
+}
