@@ -1,11 +1,11 @@
 @import "tailwindcss";
 
 /* PSA / American-inspired palette */
-@theme {
-  --color-psa-blue: #0078d2;       /* primary blue (AA/PSA style) */
-  --color-psa-red: #c8102e;        /* AA red accent */
-  --color-psa-navy: #001b3a;       /* deep nav bar / text accent */
-  --color-psa-bg: #f4f6fb;         /* light app background */
+:root {
+  --color-psa-blue: #0078d2;   /* AA/PSA primary blue */
+  --color-psa-red: #c8102e;    /* AA red */
+  --color-psa-navy: #001b3a;   /* deep nav/navy */
+  --color-psa-bg: #f4f6fb;     /* app background */
 }
 
 /* Global resets / defaults */
@@ -13,4 +13,6 @@ html,
 body {
   padding: 0;
   margin: 0;
+  background: var(--color-psa-bg);
+  color: #0f172a; /* slate-900 */
 }
