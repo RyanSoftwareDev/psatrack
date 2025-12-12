@@ -63,16 +63,24 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
       try {
         const res = await fetch(`/api/airport-layout/${airportCode}`);
 
+        if (res.status === 404){
+          setLayout(null);
+          setError("new-base");
+          setLoading(false);
+          return;
+        }
         if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
+          throw new Error('http ${res.status}');
         }
 
         const data = await res.json();
+        setLayout(data);
+        setError(null);
         const airport = (data as any).airport;
         if (!airport) {
           throw new Error("Malformed API response (missing airport)");
         }
-
+        
         const raw = airport.layout;
         const parsed: AirportLayout =
           typeof raw === "string" ? JSON.parse(raw) : raw;
