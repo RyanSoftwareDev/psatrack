@@ -158,6 +158,7 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-950/95">
       <AnyMapContainer
+        key={airportCode}
         center={center}
         zoom={14}
         scrollWheelZoom
