@@ -1,38 +1,41 @@
 "use client";
 
+import "leaflet/dist/leaflet.css";
+import L from "leaflet";
+import { useMemo } from "react";
 import {
   MapContainer as LeafletMapContainer,
   TileLayer as LeafletTileLayer,
-  CircleMarker as LeafletCircleMarker,
+  Marker as LeafletMarker,
+  Tooltip as LeafletTooltip,
   useMapEvents,
 } from "react-leaflet";
-import "leaflet/dist/leaflet.css";
 
 const MapContainer = LeafletMapContainer as any;
 const TileLayer = LeafletTileLayer as any;
-const CircleMarker = LeafletCircleMarker as any;
+const Marker = LeafletMarker as any;
+const Tooltip = LeafletTooltip as any;
 
-type LatLng = { lat: number; lon: number };
+export type LatLng = { lat: number; lon: number };
 
-type Gate = {
-  id: string;
+export type Gate = {
+  id: string; // human label like "A12", "18", etc
   position: LatLng;
 };
 
-type Props = {
+export type Props = {
   center: LatLng;
   gates: Gate[];
+
   onAddGate: (pos: LatLng) => void;
+  onMoveGate: (id: string, pos: LatLng) => void;
+  onRenameGate: (oldId: string, newId: string) => void;
+  onDeleteGate: (id: string) => void;
 };
 
-function ClickToAddGate({
-  onAdd,
-}: {
-  onAdd: (pos: LatLng) => void;
-}) {
+function ClickToAddGate({ onAdd }: { onAdd: (pos: LatLng) => void }) {
   useMapEvents({
     click(e: any) {
-      console.log("Map click:", e.latlng);
       onAdd({ lat: e.latlng.lat, lon: e.latlng.lng });
     },
   });
@@ -43,25 +46,70 @@ export function LayoutEditorMap({
   center,
   gates,
   onAddGate,
+  onMoveGate,
+  onRenameGate,
+  onDeleteGate,
 }: Props) {
+  const gateIcon = useMemo(() => {
+    return L.divIcon({
+      className: "",
+      html: `
+        <div style="
+          width: 12px;
+          height: 12px;
+          border-radius: 999px;
+          background: rgba(34,197,94,0.95);
+          border: 2px solid rgba(255,255,255,0.85);
+          box-shadow: 0 4px 10px rgba(0,0,0,0.35);
+        "></div>
+      `,
+      iconSize: [12, 12],
+      iconAnchor: [6, 6],
+    });
+  }, []);
+
   return (
     <MapContainer
-      key={`${center.lat}-${center.lon}-${gates.length}`}
       center={[center.lat, center.lon]}
       zoom={14}
-      className="h-[500px] w-full rounded-xl"
+      className="h-[520px] w-full rounded-xl"
     >
       <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
 
       <ClickToAddGate onAdd={onAddGate} />
 
       {gates.map((g) => (
-        <CircleMarker
+        <Marker
           key={g.id}
-          center={[g.position.lat, g.position.lon]}
-          radius={5}
-          pathOptions={{ color: "#22c55e" }}
-        />
+          position={[g.position.lat, g.position.lon]}
+          icon={gateIcon}
+          draggable
+          eventHandlers={{
+            dragend: (e: any) => {
+              const p = e.target.getLatLng();
+              onMoveGate(g.id, { lat: p.lat, lon: p.lng });
+            },
+
+            click: () => {
+              const next = window
+                .prompt("Rename gate:", g.id)
+                ?.trim()
+                .toUpperCase();
+              if (!next || next === g.id) return;
+              onRenameGate(g.id, next);
+            },
+
+            contextmenu: () => {
+              const ok = window.confirm(`Delete gate "${g.id}"?`);
+              if (!ok) return;
+              onDeleteGate(g.id);
+            },
+          }}
+        >
+          <Tooltip direction="top" offset={[0, -8]} opacity={0.95}>
+            Gate {g.id}
+          </Tooltip>
+        </Marker>
       ))}
     </MapContainer>
   );
