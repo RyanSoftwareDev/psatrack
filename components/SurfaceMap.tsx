@@ -9,6 +9,8 @@ import {
   Tooltip as LeafletTooltip,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
+import { useCallback } from "react";
+
 
 // Loosen the types so TS stops complaining in Next 16
 const AnyMapContainer = LeafletMapContainer as any;
@@ -50,6 +52,27 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   const [layout, setLayout] = useState<AirportLayout | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<"new-base" | "generic" | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+const exitFullscreen = useCallback(() => setIsFullscreen(false), []);
+
+useEffect(() => {
+  if (!isFullscreen) return;
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Escape") setIsFullscreen(false);
+  };
+
+  document.addEventListener("keydown", onKeyDown);
+  // Prevent background scroll while fullscreen
+  document.body.style.overflow = "hidden";
+
+  return () => {
+    document.removeEventListener("keydown", onKeyDown);
+    document.body.style.overflow = "";
+  };
+}, [isFullscreen]);
+
 
   useEffect(() => {
     let cancelled = false;
@@ -163,53 +186,104 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
     fillOpacity: 0.7,
   } as any;
 
-  return (
-    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-950/95">
-      <AnyMapContainer
-        key={airportCode.toUpperCase()} // ✅ remounts when base changes
-        center={center}
-        zoom={14}
-        scrollWheelZoom
-        className="h-[420px] w-full"
-      >
-        <AnyTileLayer
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+const MapUI = (
+  <div className="relative h-full w-full">
+    {/* Fullscreen button */}
+    <button
+      type="button"
+      onClick={() => setIsFullscreen(true)}
+      className="absolute right-3 top-3 z-[500] rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-xs font-medium text-slate-100 shadow hover:bg-slate-900"
+      title="Fullscreen"
+    >
+      Full screen
+    </button>
+
+    <AnyMapContainer
+      key={`${airportCode}-${isFullscreen ? "fs" : "normal"}`}
+      center={center}
+      zoom={14}
+      scrollWheelZoom
+      className="h-full w-full"
+    >
+      <AnyTileLayer
+        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+      />
+
+      {/* Runways */}
+      {layout.runways?.map((r) => (
+        <AnyPolygon
+          key={r.id}
+          positions={r.outline.map((pt) => [pt[0], pt[1]] as [number, number])}
+          pathOptions={runwayStyle}
         />
+      ))}
 
-        {/* Runways */}
-        {layout.runways?.map((r) => (
-          <AnyPolygon
-            key={r.id}
-            positions={r.outline.map((pt) => [pt[0], pt[1]] as [number, number])}
-            pathOptions={runwayStyle}
-          />
-        ))}
+      {/* Gates */}
+      {layout.gates?.map((g) => (
+        <AnyCircleMarker
+          key={g.id}
+          center={[g.position.lat, g.position.lon]}
+          radius={4}
+          pathOptions={freeGateStyle}
+        >
+          <AnyTooltip direction="top" offset={[0, -4]}>
+            Gate {g.id}
+          </AnyTooltip>
+        </AnyCircleMarker>
+      ))}
 
-        {/* Gates */}
-        {layout.gates?.map((g) => (
-          <AnyCircleMarker
-            key={g.id}
-            center={[g.position.lat, g.position.lon]}
-            radius={4}
-            pathOptions={freeGateStyle}
-          >
-            <AnyTooltip direction="top" offset={[0, -4]}>
-              Gate {g.id}
-            </AnyTooltip>
-          </AnyCircleMarker>
-        ))}
+      {/* Taxi nodes */}
+      {layout.taxiGraph?.map((node) => (
+        <AnyCircleMarker
+          key={node.id}
+          center={[node.lat, node.lon]}
+          radius={2}
+          pathOptions={taxiNodeStyle}
+        />
+      ))}
+    </AnyMapContainer>
+  </div>
+);
 
-        {/* Taxi nodes */}
-        {layout.taxiGraph?.map((node) => (
-          <AnyCircleMarker
-            key={node.id}
-            center={[node.lat, node.lon]}
-            radius={2}
-            pathOptions={taxiNodeStyle}
-          />
-        ))}
-      </AnyMapContainer>
+return (
+  <>
+    {/* Normal embedded map */}
+    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-950/95">
+      <div className="h-[420px] w-full">{MapUI}</div>
     </div>
-  );
+
+    {/* Fullscreen overlay */}
+    {isFullscreen && (
+      <div
+        className="fixed inset-0 z-[9999] bg-black/70"
+        onMouseDown={(e) => {
+          // clicking the backdrop closes
+          if (e.target === e.currentTarget) exitFullscreen();
+        }}
+      >
+        <div className="absolute inset-3 overflow-hidden rounded-2xl border border-slate-700 bg-slate-950">
+          {/* Top bar */}
+          <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+            <div className="text-sm font-semibold text-slate-100">
+              {airportCode.toUpperCase()} Surface Map
+            </div>
+            <button
+              type="button"
+              onClick={exitFullscreen}
+              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-100 hover:bg-slate-800"
+              title="Exit (Esc)"
+            >
+              Exit
+            </button>
+          </div>
+
+          {/* Fullscreen map area */}
+          <div className="h-[calc(100%-52px)] w-full">{MapUI}</div>
+        </div>
+      </div>
+    )}
+  </>
+);
+
 }
