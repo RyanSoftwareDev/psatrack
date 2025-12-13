@@ -188,15 +188,18 @@ useEffect(() => {
 
 const MapUI = (
   <div className="relative h-full w-full">
-    {/* Fullscreen button */}
-    <button
-      type="button"
-      onClick={() => setIsFullscreen(true)}
-      className="absolute right-3 top-3 z-[500] rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-xs font-medium text-slate-100 shadow hover:bg-slate-900"
-      title="Fullscreen"
-    >
-      Full screen
-    </button>
+{/* Fullscreen button (only in embedded mode) */}
+{!isFullscreen && (
+  <button
+    type="button"
+    onClick={() => setIsFullscreen(true)}
+    className="absolute right-3 top-3 z-[500] rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-xs font-medium text-slate-100 shadow hover:bg-slate-900"
+    title="Fullscreen"
+  >
+    Full screen
+  </button>
+)}
+
 
     <AnyMapContainer
       key={`${airportCode}-${isFullscreen ? "fs" : "normal"}`}
