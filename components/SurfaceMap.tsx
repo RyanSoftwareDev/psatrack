@@ -18,7 +18,6 @@ const AnyCircleMarker = LeafletCircleMarker as any;
 const AnyTooltip = LeafletTooltip as any;
 
 // ---- Types that match the JSON we store in Supabase ----
-
 type Runway = {
   id: string;
   outline: [number, number][]; // [lat, lon] pairs
@@ -44,84 +43,93 @@ type AirportLayout = {
 
 type SurfaceMapProps = {
   airportCode: string;
-  airportName: string;
+  airportName?: string;
 };
 
 export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   const [layout, setLayout] = useState<AirportLayout | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<"new-base" | "generic" | null>(null);
 
-  // Fetch layout from /api/airport-layout/[airportCode]
   useEffect(() => {
     let cancelled = false;
 
     async function loadLayout() {
       setLoading(true);
       setError(null);
+      setLayout(null); // ✅ prevents old base center from flashing
 
       try {
-        const res = await fetch(`/api/airport-layout/${airportCode}`);
+        const code = airportCode.toUpperCase().trim();
+        const res = await fetch(`/api/airport-layout/${code}`);
 
-        if (res.status === 404){
-          setLayout(null);
-          setError("new-base");
-          setLoading(false);
+        // 404 = normal "no layout yet"
+        if (res.status === 404) {
+          if (!cancelled) {
+            setError("new-base");
+            setLayout(null);
+          }
           return;
         }
+
         if (!res.ok) {
-          throw new Error('http ${res.status}');
+          throw new Error(`HTTP ${res.status}`);
         }
 
         const data = await res.json();
-        setLayout(data);
-        setError(null);
         const airport = (data as any).airport;
-        if (!airport) {
-          throw new Error("Malformed API response (missing airport)");
-        }
-        
+        if (!airport) throw new Error("Malformed API response (missing airport)");
+
         const raw = airport.layout;
-        const parsed: AirportLayout =
-          typeof raw === "string" ? JSON.parse(raw) : raw;
+        const parsed: AirportLayout = typeof raw === "string" ? JSON.parse(raw) : raw;
+
+        if (!parsed?.center?.lat || typeof parsed.center.lon !== "number") {
+          throw new Error("Malformed layout JSON (missing center lat/lon)");
+        }
 
         if (!cancelled) {
           setLayout(parsed);
+          setError(null);
         }
       } catch (err) {
         console.error("Failed to load airport layout", err);
         if (!cancelled) {
-          setError("Unable to load airport layout.");
+          setError("generic");
           setLayout(null);
         }
       } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+        if (!cancelled) setLoading(false);
       }
     }
 
-    loadLayout();
+    if (airportCode) loadLayout();
 
     return () => {
       cancelled = true;
     };
   }, [airportCode]);
 
-  // ---- Loading / error / empty states ----
-
+  // ---- UI states ----
   if (loading && !layout) {
     return (
       <div className="flex h-[420px] items-center justify-center text-sm text-slate-500">
-        Loading layout for {airportCode}…
+        Loading layout for {airportCode.toUpperCase()}…
       </div>
     );
   }
 
-  if (error) {
+  if (error === "new-base") {
     return (
-      <div className="flex h-[420px] items-center justify-center text-sm text-red-500">
-        {error}
+      <div className="flex h-[420px] items-center justify-center text-sm text-slate-300">
+        No layout saved yet for <span className="mx-1 font-mono">{airportCode.toUpperCase()}</span>.
+      </div>
+    );
+  }
+
+  if (error === "generic") {
+    return (
+      <div className="flex h-[420px] items-center justify-center text-sm text-red-400">
+        Unable to load airport layout.
       </div>
     );
   }
@@ -129,7 +137,7 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   if (!layout) {
     return (
       <div className="flex h-[420px] items-center justify-center text-sm text-slate-500">
-        No layout data found for {airportCode}.
+        Select a base to view its surface layout.
       </div>
     );
   }
@@ -158,7 +166,7 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   return (
     <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-950/95">
       <AnyMapContainer
-        key={airportCode}
+        key={airportCode.toUpperCase()} // ✅ remounts when base changes
         center={center}
         zoom={14}
         scrollWheelZoom
@@ -173,9 +181,7 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
         {layout.runways?.map((r) => (
           <AnyPolygon
             key={r.id}
-            positions={r.outline.map(
-              (pt) => [pt[0], pt[1]] as [number, number]
-            )}
+            positions={r.outline.map((pt) => [pt[0], pt[1]] as [number, number])}
             pathOptions={runwayStyle}
           />
         ))}

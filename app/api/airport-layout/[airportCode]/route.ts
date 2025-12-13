@@ -2,17 +2,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabaseClient";
 
-type RouteParams = {
-  airportCode: string;
-};
+type RouteParams = { airportCode: string };
 
-// In Next 16 route handlers, `params` is passed as a Promise
 export async function GET(
   req: NextRequest,
   context: { params: Promise<RouteParams> }
 ) {
   const { airportCode } = await context.params;
-  const code = (airportCode || "").toUpperCase();
+  const code = (airportCode || "").toUpperCase().trim();
 
   if (!code) {
     return NextResponse.json(
@@ -28,12 +25,16 @@ export async function GET(
       .from("airport_layouts")
       .select("*")
       .eq("airport_code", code)
-      .single();
+      .maybeSingle();
 
-    if (error || !data) {
+    if (error) {
       console.error("Supabase error fetching airport layout:", error);
+      return NextResponse.json({ error: "SUPABASE_ERROR" }, { status: 500 });
+    }
+
+    if (!data) {
       return NextResponse.json(
-        { error: `No layout found for airport ${code}` },
+        { error: "NOT_FOUND", message: `No layout found for airport ${code}` },
         { status: 404 }
       );
     }
@@ -42,7 +43,7 @@ export async function GET(
   } catch (e) {
     console.error("Unexpected error in airport-layout route:", e);
     return NextResponse.json(
-      { error: "Internal server error loading airport layout" },
+      { error: "INTERNAL_ERROR", message: "Internal server error loading airport layout" },
       { status: 500 }
     );
   }
