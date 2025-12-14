@@ -19,14 +19,13 @@ const Tooltip = LeafletTooltip as any;
 export type LatLng = { lat: number; lon: number };
 
 export type Gate = {
-  id: string; // human label like "A12", "18", etc
+  id: string; // "A12", "18", etc
   position: LatLng;
 };
 
-export type Props = {
+export type LayoutEditorMapProps = {
   center: LatLng;
   gates: Gate[];
-
   onAddGate: (pos: LatLng) => void;
   onMoveGate: (id: string, pos: LatLng) => void;
   onRenameGate: (oldId: string, newId: string) => void;
@@ -49,7 +48,7 @@ export function LayoutEditorMap({
   onMoveGate,
   onRenameGate,
   onDeleteGate,
-}: Props) {
+}: LayoutEditorMapProps) {
   const gateIcon = useMemo(() => {
     return L.divIcon({
       className: "",
@@ -89,7 +88,6 @@ export function LayoutEditorMap({
               const p = e.target.getLatLng();
               onMoveGate(g.id, { lat: p.lat, lon: p.lng });
             },
-
             click: () => {
               const next = window
                 .prompt("Rename gate:", g.id)
@@ -98,7 +96,6 @@ export function LayoutEditorMap({
               if (!next || next === g.id) return;
               onRenameGate(g.id, next);
             },
-
             contextmenu: () => {
               const ok = window.confirm(`Delete gate "${g.id}"?`);
               if (!ok) return;

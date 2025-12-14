@@ -2,10 +2,17 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
-import type { Gate, LatLng } from "@/components/admin/LayoutEditorMap";
+import type {
+  LayoutEditorMapProps,
+  LatLng,
+  Gate,
+} from "@/components/admin/LayoutEditorMap";
 
-const LayoutEditorMap = dynamic(
-  () => import("@/components/admin/LayoutEditorMap").then((m) => m.LayoutEditorMap),
+const LayoutEditorMap = dynamic<LayoutEditorMapProps>(
+  () =>
+    import("@/components/admin/LayoutEditorMap").then(
+      (m) => m.LayoutEditorMap
+    ),
   { ssr: false }
 );
 
