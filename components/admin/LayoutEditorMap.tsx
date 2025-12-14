@@ -19,17 +19,22 @@ const Tooltip = LeafletTooltip as any;
 export type LatLng = { lat: number; lon: number };
 
 export type Gate = {
-  id: string; // "A12", "18", etc
+  id: string;
   position: LatLng;
+  notes?: string;
+  preferredAircraft?: "CRJ7" | "CRJ9" | "ANY";
 };
 
-export type LayoutEditorMapProps = {
+export type Props = {
   center: LatLng;
   gates: Gate[];
+
   onAddGate: (pos: LatLng) => void;
   onMoveGate: (id: string, pos: LatLng) => void;
   onRenameGate: (oldId: string, newId: string) => void;
   onDeleteGate: (id: string) => void;
+
+  onEditGateMeta: (id: string, patch: Partial<Pick<Gate, "notes" | "preferredAircraft">>) => void;
 };
 
 function ClickToAddGate({ onAdd }: { onAdd: (pos: LatLng) => void }) {
@@ -48,7 +53,8 @@ export function LayoutEditorMap({
   onMoveGate,
   onRenameGate,
   onDeleteGate,
-}: LayoutEditorMapProps) {
+  onEditGateMeta,
+}: Props) {
   const gateIcon = useMemo(() => {
     return L.divIcon({
       className: "",
@@ -66,6 +72,15 @@ export function LayoutEditorMap({
       iconAnchor: [6, 6],
     });
   }, []);
+
+  function normalizePreferred(v?: string | null): Gate["preferredAircraft"] | undefined {
+    const s = (v || "").trim().toUpperCase();
+    if (!s) return undefined;
+    if (s === "CRJ7" || s === "CRJ-700" || s === "700") return "CRJ7";
+    if (s === "CRJ9" || s === "CRJ-900" || s === "900") return "CRJ9";
+    if (s === "ANY") return "ANY";
+    return undefined;
+  }
 
   return (
     <MapContainer
@@ -88,14 +103,43 @@ export function LayoutEditorMap({
               const p = e.target.getLatLng();
               onMoveGate(g.id, { lat: p.lat, lon: p.lng });
             },
-            click: () => {
+
+            // Click behavior:
+            // - Shift+Click = edit metadata
+            // - Click = rename
+            click: (e: any) => {
+              const isShift = !!e?.originalEvent?.shiftKey;
+
+              if (isShift) {
+                const prefRaw = window.prompt(
+                  `Preferred aircraft for gate "${g.id}"? (CRJ7 / CRJ9 / ANY)\n(leave blank = no preference)`,
+                  g.preferredAircraft || ""
+                );
+                const preferredAircraft = normalizePreferred(prefRaw);
+
+                const notesRaw = window.prompt(
+                  `Notes for gate "${g.id}"? (optional)`,
+                  g.notes || ""
+                );
+                const notes = (notesRaw ?? "").trim();
+
+                onEditGateMeta(g.id, {
+                  preferredAircraft: preferredAircraft ?? undefined,
+                  notes: notes || undefined,
+                });
+                return;
+              }
+
               const next = window
                 .prompt("Rename gate:", g.id)
                 ?.trim()
                 .toUpperCase();
+
               if (!next || next === g.id) return;
               onRenameGate(g.id, next);
             },
+
+            // Right click = delete
             contextmenu: () => {
               const ok = window.confirm(`Delete gate "${g.id}"?`);
               if (!ok) return;
@@ -104,7 +148,11 @@ export function LayoutEditorMap({
           }}
         >
           <Tooltip direction="top" offset={[0, -8]} opacity={0.95}>
-            Gate {g.id}
+            <div style={{ lineHeight: 1.15 }}>
+              <div><b>Gate {g.id}</b></div>
+              {g.preferredAircraft && <div>Pref: {g.preferredAircraft}</div>}
+              {g.notes && <div>Notes: {g.notes}</div>}
+            </div>
           </Tooltip>
         </Marker>
       ))}
