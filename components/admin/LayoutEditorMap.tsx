@@ -1,25 +1,20 @@
 "use client";
 
 import "leaflet/dist/leaflet.css";
-import L from "leaflet";
-import { useMemo } from "react";
+import L, { LeafletMouseEvent, Marker as LeafletMarkerType } from "leaflet";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  MapContainer as LeafletMapContainer,
-  TileLayer as LeafletTileLayer,
-  Marker as LeafletMarker,
-  Tooltip as LeafletTooltip,
+  MapContainer,
+  TileLayer,
+  Marker,
+  Tooltip,
   useMapEvents,
 } from "react-leaflet";
-
-const MapContainer = LeafletMapContainer as any;
-const TileLayer = LeafletTileLayer as any;
-const Marker = LeafletMarker as any;
-const Tooltip = LeafletTooltip as any;
 
 export type LatLng = { lat: number; lon: number };
 
 export type Gate = {
-  id: string;
+  id: string; // human label: "A12", "18", etc.
   position: LatLng;
   notes?: string;
   preferredAircraft?: "CRJ7" | "CRJ9" | "ANY";
@@ -27,19 +22,27 @@ export type Gate = {
 
 export type Props = {
   center: LatLng;
-  gates: Gate[];
 
+  // ✅ NEW: persisted per-base zoom
+  zoom: number;
+  onZoomChange: (zoom: number) => void;
+
+  gates: Gate[];
   onAddGate: (pos: LatLng) => void;
   onMoveGate: (id: string, pos: LatLng) => void;
   onRenameGate: (oldId: string, newId: string) => void;
   onDeleteGate: (id: string) => void;
 
-  onEditGateMeta: (id: string, patch: Partial<Pick<Gate, "notes" | "preferredAircraft">>) => void;
+  // ✅ NEW: edit notes/type
+  onEditGateMeta: (
+    id: string,
+    patch: Partial<Pick<Gate, "notes" | "preferredAircraft">>
+  ) => void;
 };
 
 function ClickToAddGate({ onAdd }: { onAdd: (pos: LatLng) => void }) {
   useMapEvents({
-    click(e: any) {
+    click(e: LeafletMouseEvent) {
       onAdd({ lat: e.latlng.lat, lon: e.latlng.lng });
     },
   });
@@ -48,6 +51,8 @@ function ClickToAddGate({ onAdd }: { onAdd: (pos: LatLng) => void }) {
 
 export function LayoutEditorMap({
   center,
+  zoom,
+  onZoomChange,
   gates,
   onAddGate,
   onMoveGate,
@@ -55,6 +60,7 @@ export function LayoutEditorMap({
   onDeleteGate,
   onEditGateMeta,
 }: Props) {
+  // A clean, modern “dot” marker
   const gateIcon = useMemo(() => {
     return L.divIcon({
       className: "",
@@ -73,23 +79,35 @@ export function LayoutEditorMap({
     });
   }, []);
 
-  function normalizePreferred(v?: string | null): Gate["preferredAircraft"] | undefined {
-    const s = (v || "").trim().toUpperCase();
-    if (!s) return undefined;
-    if (s === "CRJ7" || s === "CRJ-700" || s === "700") return "CRJ7";
-    if (s === "CRJ9" || s === "CRJ-900" || s === "900") return "CRJ9";
-    if (s === "ANY") return "ANY";
-    return undefined;
+  // Debounce zoom updates so we don't spam state on every wheel tick
+  const zoomTimer = useRef<any>(null);
+  const [internalZoom, setInternalZoom] = useState<number>(zoom);
+
+  useEffect(() => setInternalZoom(zoom), [zoom]);
+
+  function ZoomListener() {
+    useMapEvents({
+      zoomend(e) {
+        const z = e.target.getZoom?.();
+        if (typeof z !== "number") return;
+        setInternalZoom(z);
+
+        if (zoomTimer.current) clearTimeout(zoomTimer.current);
+        zoomTimer.current = setTimeout(() => onZoomChange(z), 200);
+      },
+    });
+    return null;
   }
 
   return (
     <MapContainer
       center={[center.lat, center.lon]}
-      zoom={14}
+      zoom={internalZoom}
       className="h-[520px] w-full rounded-xl"
     >
       <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
 
+      <ZoomListener />
       <ClickToAddGate onAdd={onAddGate} />
 
       {gates.map((g) => (
@@ -99,42 +117,49 @@ export function LayoutEditorMap({
           icon={gateIcon}
           draggable
           eventHandlers={{
-            dragend: (e: any) => {
-              const p = e.target.getLatLng();
+            dragend: (e) => {
+              const marker = e.target as LeafletMarkerType;
+              const p = marker.getLatLng();
               onMoveGate(g.id, { lat: p.lat, lon: p.lng });
             },
 
-            // Click behavior:
-            // - Shift+Click = edit metadata
-            // - Click = rename
-            click: (e: any) => {
-              const isShift = !!e?.originalEvent?.shiftKey;
+            // Shift+Click = edit meta
+            click: (e) => {
+              const original = e.originalEvent as MouseEvent | undefined;
+              const isShift = !!original?.shiftKey;
 
               if (isShift) {
-                const prefRaw = window.prompt(
-                  `Preferred aircraft for gate "${g.id}"? (CRJ7 / CRJ9 / ANY)\n(leave blank = no preference)`,
-                  g.preferredAircraft || ""
+                const notes = window.prompt(
+                  `Notes for gate ${g.id} (blank clears):`,
+                  g.notes ?? ""
                 );
-                const preferredAircraft = normalizePreferred(prefRaw);
+                if (notes === null) return; // cancelled
 
-                const notesRaw = window.prompt(
-                  `Notes for gate "${g.id}"? (optional)`,
-                  g.notes || ""
-                );
-                const notes = (notesRaw ?? "").trim();
+                const pref = window
+                  .prompt(
+                    `Preferred aircraft for ${g.id}: CRJ7 / CRJ9 / ANY`,
+                    (g.preferredAircraft ?? "ANY").toUpperCase()
+                  )
+                  ?.trim()
+                  .toUpperCase();
+
+                const preferredAircraft =
+                  pref === "CRJ7" || pref === "CRJ9" || pref === "ANY"
+                    ? (pref as Gate["preferredAircraft"])
+                    : g.preferredAircraft ?? "ANY";
 
                 onEditGateMeta(g.id, {
-                  preferredAircraft: preferredAircraft ?? undefined,
-                  notes: notes || undefined,
+                  notes: notes.trim() ? notes : undefined,
+                  preferredAircraft,
                 });
                 return;
               }
 
+              // normal click = rename
               const next = window
                 .prompt("Rename gate:", g.id)
                 ?.trim()
                 .toUpperCase();
-
               if (!next || next === g.id) return;
               onRenameGate(g.id, next);
             },
@@ -148,11 +173,10 @@ export function LayoutEditorMap({
           }}
         >
           <Tooltip direction="top" offset={[0, -8]} opacity={0.95}>
-            <div style={{ lineHeight: 1.15 }}>
-              <div><b>Gate {g.id}</b></div>
-              {g.preferredAircraft && <div>Pref: {g.preferredAircraft}</div>}
-              {g.notes && <div>Notes: {g.notes}</div>}
-            </div>
+            Gate {g.id}
+            {g.preferredAircraft && g.preferredAircraft !== "ANY"
+              ? ` · ${g.preferredAircraft}`
+              : ""}
           </Tooltip>
         </Marker>
       ))}
