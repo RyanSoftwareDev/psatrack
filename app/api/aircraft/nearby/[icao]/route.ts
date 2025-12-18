@@ -1,22 +1,12 @@
+// app/api/aircraft/nearby/[icao]/route.ts
 import { NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 import { getOpenSkyToken } from "@/lib/openskyAuth";
-
-const memCache = new Map<string, { ts: number; payload: any }>();
-const MEM_CACHE_MS = 6000; // your 5s polling safety
 
 export const runtime = "nodejs";
 
-function isPsaAircraft(a: {
-  callsign?: string | null;
-}): boolean {
-  if (!a?.callsign) return false;
-
-  const cs = a.callsign.trim().toUpperCase();
-
-  // PSA Airlines = JIA####
-  return cs.startsWith("JIA");
-}
+const memCache = new Map<string, { ts: number; payload: any }>();
+const MEM_CACHE_MS = 6000; // UI polls ~5s
 
 const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
   SAV: { icao: "KSAV", lat: 32.1270, lon: -81.2020 },
@@ -28,10 +18,15 @@ const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
 
 type Ctx = { params: Promise<{ icao: string }> };
 
-const DEFAULT_RADIUS_NM = 500; // 1200 is huge and more likely to get throttled/timeouts
-const FRESH_TTL_MS = 15_000; // serve cached if it's newer than this
-const FETCH_TIMEOUT_MS = 9_000; // keep under Vercel’s connect timeout pain
+const DEFAULT_RADIUS_NM = 500;
+const FRESH_TTL_MS = 15_000; // DB cache freshness window
+const FETCH_TIMEOUT_MS = 9_000; // keep under serverless pain
 const COOLDOWN_ON_FAIL_MS = 30_000;
+
+function isPsaAircraft(a: { callsign?: string | null }): boolean {
+  const cs = (a?.callsign ?? "").trim().toUpperCase();
+  return cs.startsWith("JIA"); // PSA callsign prefix
+}
 
 function nmToKm(nm: number) {
   return nm * 1.852;
@@ -50,6 +45,7 @@ function bboxFromCenter(lat: number, lon: number, radiusNm: number) {
 }
 
 async function readDbCache(base: string) {
+  const supabaseAdmin = getSupabaseAdmin();
   const { data } = await supabaseAdmin
     .from("aircraft_cache")
     .select("*")
@@ -59,6 +55,7 @@ async function readDbCache(base: string) {
 }
 
 async function writeDbCache(base: string, payload: any) {
+  const supabaseAdmin = getSupabaseAdmin();
   await supabaseAdmin.from("aircraft_cache").upsert({
     base_code: base,
     updated_at: new Date().toISOString(),
@@ -68,12 +65,15 @@ async function writeDbCache(base: string, payload: any) {
 }
 
 async function setCooldown(base: string, cachedPayload: any) {
+  const supabaseAdmin = getSupabaseAdmin();
   const cooldownUntil = new Date(Date.now() + COOLDOWN_ON_FAIL_MS).toISOString();
+
   await supabaseAdmin.from("aircraft_cache").upsert({
     base_code: base,
     updated_at: new Date().toISOString(),
     cooldown_until: cooldownUntil,
-    payload: cachedPayload ?? { airport: { code: base }, radiusNm: null, aircraft: [] },
+    payload:
+      cachedPayload ?? { airport: { code: base }, radiusNm: null, aircraft: [] },
   });
 }
 
@@ -92,7 +92,7 @@ export async function GET(req: Request, { params }: Ctx) {
 
   const cacheKey = `${key}:${radiusNm.toFixed(2)}`;
 
-  // 0) tiny in-memory cache (helps localhost + repeat calls)
+  // 0) small in-memory cache (reduces hammering)
   const mem = memCache.get(cacheKey);
   if (mem && Date.now() - mem.ts < MEM_CACHE_MS) {
     return NextResponse.json(mem.payload, {
@@ -100,41 +100,42 @@ export async function GET(req: Request, { params }: Ctx) {
     });
   }
 
-  // 1) read Supabase cache
-  let dbCached = null as any;
+  // 1) DB cache (Supabase)
+  let dbCached: any = null;
   try {
     dbCached = await readDbCache(key);
   } catch {
-    // ignore DB cache errors; we’ll still try OpenSky
+    // ignore DB read issues, we’ll try OpenSky anyway
   }
 
   const now = Date.now();
   const dbUpdated = dbCached?.updated_at ? new Date(dbCached.updated_at).getTime() : 0;
-  const dbIsFresh = dbCached && now - dbUpdated < FRESH_TTL_MS;
+  const dbIsFresh = !!dbCached && now - dbUpdated < FRESH_TTL_MS;
 
   const cooldownUntil = dbCached?.cooldown_until
     ? new Date(dbCached.cooldown_until).getTime()
     : 0;
   const inCooldown = cooldownUntil && now < cooldownUntil;
 
-  // If cached is fresh or we're cooling down, serve it immediately
+  // If DB cache is fresh or in cooldown, serve it immediately
   if ((dbIsFresh || inCooldown) && dbCached?.payload) {
-const filteredAircraft = Array.isArray(dbCached.payload?.aircraft)
-  ? dbCached.payload.aircraft.filter(isPsaAircraft)
-  : [];
+    const filteredAircraft = Array.isArray(dbCached.payload?.aircraft)
+      ? dbCached.payload.aircraft.filter(isPsaAircraft)
+      : [];
 
-const payload = {
-  ...dbCached.payload,
-  aircraft: filteredAircraft,
-  stale: !dbIsFresh,
-  source: dbIsFresh ? "cache_fresh" : "cache_cooldown",
-  updatedAt: dbCached.updated_at,
-};
+    const payload = {
+      ...dbCached.payload,
+      aircraft: filteredAircraft,
+      stale: !dbIsFresh,
+      source: dbIsFresh ? "cache_fresh" : "cache_cooldown",
+      updatedAt: dbCached.updated_at,
+    };
+
     memCache.set(cacheKey, { ts: Date.now(), payload });
     return NextResponse.json(payload);
   }
 
-  // 2) compute bbox and hit OpenSky (with hard timeout)
+  // 2) Live OpenSky fetch (OAuth)
   const { lamin, lomin, lamax, lomax } = bboxFromCenter(
     airport.lat,
     airport.lon,
@@ -150,109 +151,95 @@ const payload = {
     `&extended=1`;
 
   try {
-const controller = new AbortController();
-const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-const token = await getOpenSkyToken();
+    let response = await fetch(openskyUrl, {
+      cache: "no-store",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "psatrack/0.1 (contact: you)",
+        Authorization: `Bearer ${await getOpenSkyToken()}`,
+      },
+    }).finally(() => clearTimeout(t));
 
-const res = await fetch(openskyUrl, {
-  cache: "no-store",
-  signal: controller.signal,
-  headers: {
-    "User-Agent": "psatrack/0.1 (contact: you)",
-    Authorization: `Bearer ${token}`,
-  },
-}).finally(() => clearTimeout(t));
+    // Retry once on 401 (token issues)
+    if (response.status === 401) {
+      const controller2 = new AbortController();
+      const t2 = setTimeout(() => controller2.abort(), FETCH_TIMEOUT_MS);
 
-if (res.status === 401) {
-  // token likely expired — refresh and retry once
-  const controller2 = new AbortController();
-  const t2 = setTimeout(() => controller2.abort(), FETCH_TIMEOUT_MS);
-
-  const freshToken = await getOpenSkyToken();
-
-  const retry = await fetch(openskyUrl, {
-    cache: "no-store",
-    signal: controller2.signal,
-    headers: {
-      "User-Agent": "psatrack/0.1 (contact: you)",
-      Authorization: `Bearer ${freshToken}`,
-    },
-  }).finally(() => clearTimeout(t2));
-
-  if (!retry.ok) {
-    // treat like failure and go to fallback path
-    throw new Error(`OpenSky retry failed: ${retry.status}`);
-  }
-
-  // then set `resJson` based on retry instead of `res`
-}
-
-
-
-
-    if (!res.ok) {
-      // if OpenSky fails, return cached if we have it, and set cooldown
-const fallbackRaw = dbCached?.payload ?? {
-  airport: { code: key, ...airport },
-  radiusNm,
-  aircraft: [],
-};
-
-const fallback = {
-  ...fallbackRaw,
-  aircraft: Array.isArray(fallbackRaw.aircraft)
-    ? fallbackRaw.aircraft.filter(isPsaAircraft)
-    : [],
-};
-      await setCooldown(key, fallback);
-
-      return NextResponse.json(
-        {
-          ...fallback,
-          stale: true,
-          source: `cache_http_${res.status}`,
-          updatedAt: dbCached?.updated_at ?? null,
+      response = await fetch(openskyUrl, {
+        cache: "no-store",
+        signal: controller2.signal,
+        headers: {
+          "User-Agent": "psatrack/0.1 (contact: you)",
+          Authorization: `Bearer ${await getOpenSkyToken()}`,
         },
-        { status: 200 }
-      );
+      }).finally(() => clearTimeout(t2));
     }
 
-    const data = await res.json();
+    if (!response.ok) {
+      const fallbackRaw =
+        dbCached?.payload ?? {
+          airport: { code: key, ...airport },
+          radiusNm,
+          aircraft: [],
+        };
+
+      const fallback = {
+        ...fallbackRaw,
+        aircraft: Array.isArray(fallbackRaw.aircraft)
+          ? fallbackRaw.aircraft.filter(isPsaAircraft)
+          : [],
+      };
+
+      // Set cooldown so prod stops hammering
+      try {
+        await setCooldown(key, fallback);
+      } catch {}
+
+      const payload = {
+        ...fallback,
+        stale: true,
+        source: `cache_http_${response.status}`,
+        updatedAt: dbCached?.updated_at ?? null,
+      };
+
+      memCache.set(cacheKey, { ts: Date.now(), payload });
+      return NextResponse.json(payload, { status: 200 });
+    }
+
+    const data = await response.json();
     const states: any[] = Array.isArray(data?.states) ? data.states : [];
 
-const aircraft = states
-  .map((s) => {
-    const icao24 = s?.[0] ?? null;
+    const aircraft = states
+      .map((s) => {
+        const icao24 = s?.[0] ?? null;
+        const callsignRaw =
+          typeof s?.[1] === "string" ? s[1].trim().toUpperCase() : "";
+        const lon = s?.[5];
+        const lat = s?.[6];
+        const onGround = !!s?.[8];
+        const velocityMs = s?.[9] ?? null;
+        const track = s?.[10] ?? null;
+        const lastContact = s?.[4] ?? null;
 
-    // normalize callsign so filtering is reliable
-    const callsignRaw =
-      typeof s?.[1] === "string" ? s[1].trim().toUpperCase() : "";
+        if (typeof lat !== "number" || typeof lon !== "number") return null;
 
-    const lon = s?.[5];
-    const lat = s?.[6];
-    const onGround = !!s?.[8];
-    const velocityMs = s?.[9] ?? null;
-    const track = s?.[10] ?? null;
-    const lastContact = s?.[4] ?? null;
-
-    if (typeof lat !== "number" || typeof lon !== "number") return null;
-
-    return {
-      icao24,
-      callsign: callsignRaw || null,
-      lat,
-      lon,
-      onGround,
-      velocity: velocityMs,
-      track,
-      lastContact,
-      source: "opensky",
-    };
-  })
-  .filter((a): a is NonNullable<typeof a> => !!a)
-  // PSA Airlines ICAO callsign prefix
-  .filter((a) => (a.callsign ?? "").startsWith("JIA"));
+        return {
+          icao24,
+          callsign: callsignRaw || null,
+          lat,
+          lon,
+          onGround,
+          velocity: velocityMs,
+          track,
+          lastContact,
+          source: "opensky",
+        };
+      })
+      .filter((a): a is NonNullable<typeof a> => !!a)
+      .filter(isPsaAircraft);
 
     const payload = {
       airport: { code: key, ...airport },
@@ -263,47 +250,44 @@ const aircraft = states
       updatedAt: new Date().toISOString(),
     };
 
-    // write-through cache (Supabase + memory)
+    // write-through cache
     try {
       await writeDbCache(key, payload);
-    } catch {
-      // ignore cache write errors
-    }
+    } catch {}
 
     memCache.set(cacheKey, { ts: Date.now(), payload });
 
     return NextResponse.json(payload, {
       headers: { "Cache-Control": "s-maxage=5, stale-while-revalidate=10" },
     });
-  } catch (e: any) {
-    // fetch timeout / connect timeout — serve cached if possible and set cooldown
-const fallbackRaw = dbCached?.payload ?? {
-  airport: { code: key, ...airport },
-  radiusNm,
-  aircraft: [],
-};
+  } catch {
+    // timeout/connect fail — serve cached if possible + cooldown
+    const fallbackRaw =
+      dbCached?.payload ?? {
+        airport: { code: key, ...airport },
+        radiusNm,
+        aircraft: [],
+      };
 
-const fallback = {
-  ...fallbackRaw,
-  aircraft: Array.isArray(fallbackRaw.aircraft)
-    ? fallbackRaw.aircraft.filter(isPsaAircraft)
-    : [],
-};
+    const fallback = {
+      ...fallbackRaw,
+      aircraft: Array.isArray(fallbackRaw.aircraft)
+        ? fallbackRaw.aircraft.filter(isPsaAircraft)
+        : [],
+    };
 
     try {
       await setCooldown(key, fallback);
-    } catch {
-      // ignore
-    }
+    } catch {}
 
-    return NextResponse.json(
-      {
-        ...fallback,
-        stale: true,
-        source: "cache_fetch_failed",
-        updatedAt: dbCached?.updated_at ?? null,
-      },
-      { status: 200 }
-    );
+    const payload = {
+      ...fallback,
+      stale: true,
+      source: "cache_fetch_failed",
+      updatedAt: dbCached?.updated_at ?? null,
+    };
+
+    memCache.set(cacheKey, { ts: Date.now(), payload });
+    return NextResponse.json(payload, { status: 200 });
   }
 }
