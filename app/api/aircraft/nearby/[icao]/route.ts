@@ -1,10 +1,22 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { getOpenSkyToken } from "@/lib/openskyAuth";
 
 const memCache = new Map<string, { ts: number; payload: any }>();
 const MEM_CACHE_MS = 6000; // your 5s polling safety
 
 export const runtime = "nodejs";
+
+function isPsaAircraft(a: {
+  callsign?: string | null;
+}): boolean {
+  if (!a?.callsign) return false;
+
+  const cs = a.callsign.trim().toUpperCase();
+
+  // PSA Airlines = JIA####
+  return cs.startsWith("JIA");
+}
 
 const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
   SAV: { icao: "KSAV", lat: 32.1270, lon: -81.2020 },
@@ -16,7 +28,7 @@ const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
 
 type Ctx = { params: Promise<{ icao: string }> };
 
-const DEFAULT_RADIUS_NM = 250; // 1200 is huge and more likely to get throttled/timeouts
+const DEFAULT_RADIUS_NM = 500; // 1200 is huge and more likely to get throttled/timeouts
 const FRESH_TTL_MS = 15_000; // serve cached if it's newer than this
 const FETCH_TIMEOUT_MS = 9_000; // keep under Vercel’s connect timeout pain
 const COOLDOWN_ON_FAIL_MS = 30_000;
@@ -107,12 +119,17 @@ export async function GET(req: Request, { params }: Ctx) {
 
   // If cached is fresh or we're cooling down, serve it immediately
   if ((dbIsFresh || inCooldown) && dbCached?.payload) {
-    const payload = {
-      ...dbCached.payload,
-      stale: !dbIsFresh,
-      source: dbIsFresh ? "cache_fresh" : "cache_cooldown",
-      updatedAt: dbCached.updated_at,
-    };
+const filteredAircraft = Array.isArray(dbCached.payload?.aircraft)
+  ? dbCached.payload.aircraft.filter(isPsaAircraft)
+  : [];
+
+const payload = {
+  ...dbCached.payload,
+  aircraft: filteredAircraft,
+  stale: !dbIsFresh,
+  source: dbIsFresh ? "cache_fresh" : "cache_cooldown",
+  updatedAt: dbCached.updated_at,
+};
     memCache.set(cacheKey, { ts: Date.now(), payload });
     return NextResponse.json(payload);
   }
@@ -136,19 +153,33 @@ export async function GET(req: Request, { params }: Ctx) {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-    const res = await fetch(openskyUrl, {
-      cache: "no-store",
-      signal: controller.signal,
-      headers: { "User-Agent": "psatrack/0.1 (contact: you)" },
-    }).finally(() => clearTimeout(t));
+    // 🔐 Get OAuth token (cached in-memory)
+const token = await getOpenSkyToken();
+
+const res = await fetch(openskyUrl, {
+  cache: "no-store",
+  signal: controller.signal,
+  headers: {
+    "User-Agent": "psatrack/0.1 (contact: you)",
+    Authorization: `Bearer ${token}`,
+  },
+});
+
 
     if (!res.ok) {
       // if OpenSky fails, return cached if we have it, and set cooldown
-      const fallback = dbCached?.payload ?? {
-        airport: { code: key, ...airport },
-        radiusNm,
-        aircraft: [],
-      };
+const fallbackRaw = dbCached?.payload ?? {
+  airport: { code: key, ...airport },
+  radiusNm,
+  aircraft: [],
+};
+
+const fallback = {
+  ...fallbackRaw,
+  aircraft: Array.isArray(fallbackRaw.aircraft)
+    ? fallbackRaw.aircraft.filter(isPsaAircraft)
+    : [],
+};
       await setCooldown(key, fallback);
 
       return NextResponse.json(
@@ -165,32 +196,38 @@ export async function GET(req: Request, { params }: Ctx) {
     const data = await res.json();
     const states: any[] = Array.isArray(data?.states) ? data.states : [];
 
-    const aircraft = states
-      .map((s) => {
-        const icao24 = s?.[0] ?? null;
-        const callsign = (s?.[1] ?? "").trim() || null;
-        const lon = s?.[5];
-        const lat = s?.[6];
-        const onGround = !!s?.[8];
-        const velocityMs = s?.[9] ?? null;
-        const track = s?.[10] ?? null;
-        const lastContact = s?.[4] ?? null;
+const aircraft = states
+  .map((s) => {
+    const icao24 = s?.[0] ?? null;
 
-        if (typeof lat !== "number" || typeof lon !== "number") return null;
+    // normalize callsign so filtering is reliable
+    const callsignRaw =
+      typeof s?.[1] === "string" ? s[1].trim().toUpperCase() : "";
 
-        return {
-          icao24,
-          callsign,
-          lat,
-          lon,
-          onGround,
-          velocity: velocityMs,
-          track,
-          lastContact,
-          source: "opensky",
-        };
-      })
-      .filter(Boolean);
+    const lon = s?.[5];
+    const lat = s?.[6];
+    const onGround = !!s?.[8];
+    const velocityMs = s?.[9] ?? null;
+    const track = s?.[10] ?? null;
+    const lastContact = s?.[4] ?? null;
+
+    if (typeof lat !== "number" || typeof lon !== "number") return null;
+
+    return {
+      icao24,
+      callsign: callsignRaw || null,
+      lat,
+      lon,
+      onGround,
+      velocity: velocityMs,
+      track,
+      lastContact,
+      source: "opensky",
+    };
+  })
+  .filter((a): a is NonNullable<typeof a> => !!a)
+  // PSA Airlines ICAO callsign prefix
+  .filter((a) => (a.callsign ?? "").startsWith("JIA"));
 
     const payload = {
       airport: { code: key, ...airport },
@@ -215,11 +252,18 @@ export async function GET(req: Request, { params }: Ctx) {
     });
   } catch (e: any) {
     // fetch timeout / connect timeout — serve cached if possible and set cooldown
-    const fallback = dbCached?.payload ?? {
-      airport: { code: key, ...airport },
-      radiusNm,
-      aircraft: [],
-    };
+const fallbackRaw = dbCached?.payload ?? {
+  airport: { code: key, ...airport },
+  radiusNm,
+  aircraft: [],
+};
+
+const fallback = {
+  ...fallbackRaw,
+  aircraft: Array.isArray(fallbackRaw.aircraft)
+    ? fallbackRaw.aircraft.filter(isPsaAircraft)
+    : [],
+};
 
     try {
       await setCooldown(key, fallback);

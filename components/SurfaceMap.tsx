@@ -130,7 +130,7 @@ useEffect(() => {
   async function loadAircraft() {
     try {
       const code = airportCode.toUpperCase().trim();
-      const res = await fetch(`/api/aircraft/nearby/${code}?radiusNm=1200`, {
+      const res = await fetch(`/api/aircraft/nearby/${code}?radiusNm=500`, {
         cache: "no-store",
       });
       if (!res.ok) return;
