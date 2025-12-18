@@ -59,6 +59,39 @@ export default function DashboardPage() {
   const [airport, setAirport] = useState<AirportLayout | null>(null);
   const [loadingAirport, setLoadingAirport] = useState(false);
   const [airportError, setAirportError] = useState<string | null>(null);
+  const [occupancy, setOccupancy] = useState<any[]>([]);
+
+  useEffect(() => {
+  if (!airport?.layout?.gates) return;
+
+  async function loadOccupancy() {
+    try {
+      const [layoutRes, airRes] = await Promise.all([
+        fetch(`/api/airport-layout/${currentBase}`),
+        fetch(`/api/aircraft/nearby/${currentBase}`),
+      ]);
+
+      if (!layoutRes.ok || !airRes.ok) return;
+
+      const layoutJson = await layoutRes.json();
+      const aircraftJson = await airRes.json();
+
+      const layout = layoutJson.airport.layout;
+      const aircraft = aircraftJson.aircraft;
+
+      const { matchAircraftToGates } = await import("@/lib/gateMatching");
+
+      setOccupancy(matchAircraftToGates(aircraft, layout.gates));
+    } catch (e) {
+      console.error("Occupancy load failed", e);
+    }
+  }
+
+  loadOccupancy();
+  const t = setInterval(loadOccupancy, 15000);
+  return () => clearInterval(t);
+}, [currentBase, airport]);
+
 
   // On mount, pull base from localStorage
   useEffect(() => {
@@ -91,7 +124,7 @@ export default function DashboardPage() {
           { signal: controller.signal }
         );
 
-        if (!res.ok) {
+        if (!res.ok) { 
           const body = await res.json().catch(() => null);
           const msg =
             body?.error || `Failed to load layout for ${currentBase}`;
@@ -304,25 +337,71 @@ export default function DashboardPage() {
             </p>
           </div>
 
-          {/* Right: compliance & future analytics panel */}
+          {/* Right column */}
           <div className="space-y-4">
+            {/* Gate occupancy */}
+            <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                Gate occupancy (live)
+              </p>
+
+              <table className="w-full text-xs">
+                <thead className="border-b border-slate-200 text-slate-500">
+                  <tr>
+                    <th className="py-1 text-left font-medium">Gate</th>
+                    <th className="py-1 text-left font-medium">Aircraft</th>
+                    <th className="py-1 text-left font-medium">Type</th>
+                    <th className="py-1 text-left font-medium">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {occupancy.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="py-2 text-center text-slate-400">
+                        No gate activity detected
+                      </td>
+                    </tr>
+                  )}
+
+                  {occupancy.map((o) => (
+                    <tr key={o.gateId} className="border-t border-slate-100">
+                      <td className="py-1 font-mono">{o.gateId}</td>
+                      <td className="py-1">{o.aircraft?.callsign ?? "—"}</td>
+                      <td className="py-1">{o.aircraft ? "CRJ" : "—"}</td>
+                      <td
+                        className={`py-1 font-medium ${
+                          o.aircraft ? "text-red-600" : "text-emerald-600"
+                        }`}
+                      >
+                        {o.aircraft ? "Occupied" : "Free"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <p className="mt-2 text-[10px] text-slate-400">
+                Gate occupancy inferred from public ADS-B position + low ground speed
+              </p>
+            </div>
+
+            {/* Compliance */}
             <div className="rounded-xl border border-slate-200 bg-white p-4 text-xs text-slate-700 shadow-sm">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
                 Compliance & usage
               </p>
               <p className="mt-2 leading-snug">
-                Data sources: publicly accessible ADS-B and OpenStreetMap. This
-                tool is for visualization, analytics and education only. It is
-                not certified for ATC, operational dispatch or safety-critical
-                decision making within PSA or American Airlines.
+                Data sources: publicly accessible ADS-B and OpenStreetMap. This tool is for
+                visualization, analytics and education only. It is not certified for ATC,
+                operational dispatch or safety-critical decision making within PSA or American Airlines.
               </p>
               <p className="mt-2 text-[11px] text-slate-500">
-                All timings (gate turns, ETAs, taxi delays) will be heuristic
-                and based on public traffic snapshots, not internal schedules or
-                company systems.
+                All timings (gate turns, ETAs, taxi delays) will be heuristic and based on public traffic
+                snapshots, not internal schedules or company systems.
               </p>
             </div>
 
+            {/* Upcoming */}
             <div className="rounded-xl border border-slate-200 bg-white p-4 text-xs text-slate-700 shadow-sm">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
                 Upcoming panels
@@ -340,6 +419,7 @@ export default function DashboardPage() {
               </ul>
             </div>
           </div>
+
         </section>
       </div>
     </main>

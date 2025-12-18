@@ -10,6 +10,7 @@ import {
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import { useCallback } from "react";
+import { matchAircraftToGates } from "@/lib/gateMatching";
 
 
 // Loosen the types so TS stops complaining in Next 16
@@ -53,6 +54,53 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<"new-base" | "generic" | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+    const [aircraft, setAircraft] = useState<any[]>([]);
+  const [occupiedGateIds, setOccupiedGateIds] = useState<Set<string>>(new Set());
+
+useEffect(() => {
+  if (!airportCode) return;
+
+  let cancelled = false;
+
+  async function loadLayout() {
+    try {
+      setLoading(true);
+      setError(null);
+
+      const code = airportCode.toUpperCase().trim();
+      const res = await fetch(`/api/airport-layout/${code}`, { cache: "no-store" });
+
+      if (!res.ok) {
+        if (!cancelled) setError(res.status === 404 ? "new-base" : "generic");
+        return;
+      }
+
+      const json = await res.json();
+
+      // your API returns: { airport: { ..., layout: {...} } }
+      const raw = json?.airport?.layout;
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+
+      if (!parsed?.center?.lat || !parsed?.center?.lon) {
+        if (!cancelled) setError("new-base");
+        return;
+      }
+
+      if (!cancelled) setLayout(parsed);
+    } catch (e) {
+      console.error("Layout load failed", e);
+      if (!cancelled) setError("generic");
+    } finally {
+      if (!cancelled) setLoading(false);
+    }
+  }
+
+  loadLayout();
+  return () => {
+    cancelled = true;
+  };
+}, [airportCode]);
+
 
 const exitFullscreen = useCallback(() => setIsFullscreen(false), []);
 
@@ -74,63 +122,51 @@ useEffect(() => {
 }, [isFullscreen]);
 
 
-  useEffect(() => {
-    let cancelled = false;
+useEffect(() => {
+  if (!airportCode) return;
 
-    async function loadLayout() {
-      setLoading(true);
-      setError(null);
-      setLayout(null); // ✅ prevents old base center from flashing
+  let cancelled = false;
 
-      try {
-        const code = airportCode.toUpperCase().trim();
-        const res = await fetch(`/api/airport-layout/${code}`);
+  async function loadAircraft() {
+    try {
+      const code = airportCode.toUpperCase().trim();
+      const res = await fetch(`/api/aircraft/nearby/${code}?radiusNm=1200`, {
+        cache: "no-store",
+      });
+      if (!res.ok) return;
 
-        // 404 = normal "no layout yet"
-        if (res.status === 404) {
-          if (!cancelled) {
-            setError("new-base");
-            setLayout(null);
-          }
-          return;
-        }
+      const json = await res.json();
+      const list = Array.isArray(json?.aircraft) ? json.aircraft : [];
 
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
+      if (cancelled) return;
 
-        const data = await res.json();
-        const airport = (data as any).airport;
-        if (!airport) throw new Error("Malformed API response (missing airport)");
+      setAircraft(list);
 
-        const raw = airport.layout;
-        const parsed: AirportLayout = typeof raw === "string" ? JSON.parse(raw) : raw;
-
-        if (!parsed?.center?.lat || typeof parsed.center.lon !== "number") {
-          throw new Error("Malformed layout JSON (missing center lat/lon)");
-        }
-
-        if (!cancelled) {
-          setLayout(parsed);
-          setError(null);
-        }
-      } catch (err) {
-        console.error("Failed to load airport layout", err);
-        if (!cancelled) {
-          setError("generic");
-          setLayout(null);
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
+      // Only compute gate occupancy if gates exist
+      const gates = layout?.gates ?? [];
+      if (gates.length > 0) {
+        const occ = matchAircraftToGates(list, gates);
+        const occSet = new Set(
+          occ.filter((o) => o.aircraft).map((o) => String(o.gateId))
+        );
+        setOccupiedGateIds(occSet);
+      } else {
+        setOccupiedGateIds(new Set());
       }
+    } catch (e) {
+      console.error("Aircraft load failed", e);
     }
+  }
 
-    if (airportCode) loadLayout();
+  loadAircraft();
+  const t = setInterval(loadAircraft, 15000);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [airportCode]);
+  return () => {
+    cancelled = true;
+    clearInterval(t);
+  };
+}, [airportCode, layout]);
+
 
   // ---- UI states ----
   if (loading && !layout) {
@@ -180,6 +216,25 @@ useEffect(() => {
     fillOpacity: 0.9,
   } as any;
 
+    const occupiedGateStyle = {
+    color: "#ef4444",
+    weight: 1,
+    fillOpacity: 0.95,
+  } as any;
+
+  const aircraftAirStyle = {
+    color: "#38bdf8",
+    weight: 1,
+    fillOpacity: 0.9,
+  } as any;
+
+  const aircraftGroundStyle = {
+    color: "#a855f7",
+    weight: 1,
+    fillOpacity: 0.95,
+  } as any;
+
+
   const taxiNodeStyle = {
     color: "#fbbf24",
     weight: 1,
@@ -223,18 +278,47 @@ const MapUI = (
       ))}
 
       {/* Gates */}
-      {layout.gates?.map((g) => (
-        <AnyCircleMarker
-          key={g.id}
-          center={[g.position.lat, g.position.lon]}
-          radius={4}
-          pathOptions={freeGateStyle}
-        >
-          <AnyTooltip direction="top" offset={[0, -4]}>
-            Gate {g.id}
-          </AnyTooltip>
-        </AnyCircleMarker>
-      ))}
+      {layout.gates?.map((g) => {
+        const isOcc = occupiedGateIds.has(String(g.id));
+        return (
+          <AnyCircleMarker
+            key={g.id}
+            center={[g.position.lat, g.position.lon]}
+            radius={4}
+            pathOptions={isOcc ? occupiedGateStyle : freeGateStyle}
+          >
+            <AnyTooltip direction="top" offset={[0, -4]}>
+              Gate {g.id} {isOcc ? "• Occupied" : "• Free"}
+            </AnyTooltip>
+          </AnyCircleMarker>
+        );
+      })}
+
+      {/* Aircraft */}
+      {aircraft.map((a, idx) => {
+        const lat = a?.lat;
+        const lon = a?.lon;
+        if (typeof lat !== "number" || typeof lon !== "number") return null;
+
+        const speed = typeof a?.velocity === "number" ? a.velocity : null; // m/s
+        const onGround = !!a?.onGround;
+
+        return (
+          <AnyCircleMarker
+            key={a?.icao24 ?? a?.callsign ?? `ac-${idx}`}
+            center={[lat, lon]}
+            radius={3}
+            pathOptions={onGround ? aircraftGroundStyle : aircraftAirStyle}
+          >
+            <AnyTooltip direction="top" offset={[0, -4]}>
+              {a?.callsign ?? a?.icao24 ?? "Aircraft"}
+              {speed != null ? ` • ${(speed * 1.94384).toFixed(0)} kt` : ""}
+              {onGround ? " • GND" : ""}
+            </AnyTooltip>
+          </AnyCircleMarker>
+        );
+      })}
+
 
       {/* Taxi nodes */}
       {layout.taxiGraph?.map((node) => (
