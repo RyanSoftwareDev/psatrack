@@ -150,10 +150,9 @@ const payload = {
     `&extended=1`;
 
   try {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+const controller = new AbortController();
+const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-    // 🔐 Get OAuth token (cached in-memory)
 const token = await getOpenSkyToken();
 
 const res = await fetch(openskyUrl, {
@@ -163,7 +162,33 @@ const res = await fetch(openskyUrl, {
     "User-Agent": "psatrack/0.1 (contact: you)",
     Authorization: `Bearer ${token}`,
   },
-});
+}).finally(() => clearTimeout(t));
+
+if (res.status === 401) {
+  // token likely expired — refresh and retry once
+  const controller2 = new AbortController();
+  const t2 = setTimeout(() => controller2.abort(), FETCH_TIMEOUT_MS);
+
+  const freshToken = await getOpenSkyToken();
+
+  const retry = await fetch(openskyUrl, {
+    cache: "no-store",
+    signal: controller2.signal,
+    headers: {
+      "User-Agent": "psatrack/0.1 (contact: you)",
+      Authorization: `Bearer ${freshToken}`,
+    },
+  }).finally(() => clearTimeout(t2));
+
+  if (!retry.ok) {
+    // treat like failure and go to fallback path
+    throw new Error(`OpenSky retry failed: ${retry.status}`);
+  }
+
+  // then set `resJson` based on retry instead of `res`
+}
+
+
 
 
     if (!res.ok) {

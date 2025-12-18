@@ -26,7 +26,13 @@ type AirportLayout = {
   taxiGraph: any[];
 };
 
-const ADMIN_LAYOUT_TOKEN = "applesauce";
+const [adminToken, setAdminToken] = useState<string>("");
+
+useEffect(() => {
+  if (process.env.NODE_ENV === "production") return;
+  const t = window.prompt("Admin token:", "")?.trim() ?? "";
+  setAdminToken(t);
+}, []);
 
 export default function LayoutEditorPage() {
   const [airportCode, setAirportCode] = useState("SAV");
@@ -98,7 +104,7 @@ export default function LayoutEditorPage() {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-admin-token": ADMIN_LAYOUT_TOKEN,
+        "x-admin-token": adminToken,
       },
       body: JSON.stringify({ layout }),
     });
