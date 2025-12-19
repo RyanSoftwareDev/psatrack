@@ -1,13 +1,16 @@
 "use client";
 
-import dynamic from "next/dynamic";
+export const dynamic = "force-dynamic";
+
+import nextDynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const LayoutEditorMap = dynamic(
+const LayoutEditorMap = nextDynamic(
   () =>
     import("@/components/admin/LayoutEditorMap").then((m) => m.LayoutEditorMap),
   { ssr: false }
 );
+
 
 type LatLng = { lat: number; lon: number };
 
@@ -20,21 +23,14 @@ type Gate = {
 
 type AirportLayout = {
   center: LatLng;
-  zoom?: number; // ✅ fixed
+  zoom?: number;
   gates: Gate[];
   runways: any[];
   taxiGraph: any[];
 };
 
-const [adminToken, setAdminToken] = useState<string>("");
-
-useEffect(() => {
-  if (process.env.NODE_ENV === "production") return;
-  const t = window.prompt("Admin token:", "")?.trim() ?? "";
-  setAdminToken(t);
-}, []);
-
 export default function LayoutEditorPage() {
+  const [adminToken, setAdminToken] = useState<string>("");
   const [airportCode, setAirportCode] = useState("SAV");
   const [layout, setLayout] = useState<AirportLayout | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -43,6 +39,14 @@ export default function LayoutEditorPage() {
   // one-step undo buffer
   const undoRef = useRef<AirportLayout | null>(null);
 
+  // Prompt for admin token in dev only (client-side)
+  useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+    const t = window.prompt("Admin token:", "")?.trim() ?? "";
+    setAdminToken(t);
+  }, []);
+
+  // Disable in production
   if (process.env.NODE_ENV === "production") {
     return (
       <div className="p-6 text-red-400">
@@ -70,7 +74,6 @@ export default function LayoutEditorPage() {
       const parsed: AirportLayout =
         typeof raw === "string" ? JSON.parse(raw) : raw;
 
-      // ensure defaults / shape
       parsed.zoom = typeof parsed.zoom === "number" ? parsed.zoom : 14;
       parsed.gates = parsed.gates || [];
       parsed.runways = parsed.runways || [];
@@ -83,7 +86,6 @@ export default function LayoutEditorPage() {
   }, [airportCode]);
 
   function pushUndo(current: AirportLayout) {
-    // deep clone so future edits don’t mutate undo
     undoRef.current = JSON.parse(JSON.stringify(current));
   }
 
@@ -161,34 +163,29 @@ export default function LayoutEditorPage() {
         center={layout.center}
         zoom={layout.zoom ?? 14}
         gates={layout.gates}
-        onZoomChange={(z) => {
+        onZoomChange={(z: number) => {
           pushUndo(layout);
           setLayout({ ...layout, zoom: z });
           setDirty(true);
         }}
-        onAddGate={(pos) => {
+        onAddGate={(pos: LatLng) => {
           pushUndo(layout);
           const id = String(layout.gates.length + 1);
           setLayout({
             ...layout,
-            gates: [
-              ...layout.gates,
-              { id, position: pos, preferredAircraft: "ANY" },
-            ],
+            gates: [...layout.gates, { id, position: pos, preferredAircraft: "ANY" }],
           });
           setDirty(true);
         }}
-        onMoveGate={(id, pos) => {
+        onMoveGate={(id: string, pos: LatLng) => {
           pushUndo(layout);
           setLayout({
             ...layout,
-            gates: layout.gates.map((g) =>
-              g.id === id ? { ...g, position: pos } : g
-            ),
+            gates: layout.gates.map((g) => (g.id === id ? { ...g, position: pos } : g)),
           });
           setDirty(true);
         }}
-        onRenameGate={(oldId, newId) => {
+        onRenameGate={(oldId: string, newId: string) => {
           const next = newId.trim().toUpperCase();
           if (!next) return;
 
@@ -200,21 +197,16 @@ export default function LayoutEditorPage() {
           pushUndo(layout);
           setLayout({
             ...layout,
-            gates: layout.gates.map((g) =>
-              g.id === oldId ? { ...g, id: next } : g
-            ),
+            gates: layout.gates.map((g) => (g.id === oldId ? { ...g, id: next } : g)),
           });
           setDirty(true);
         }}
-        onDeleteGate={(id) => {
+        onDeleteGate={(id: string) => {
           pushUndo(layout);
-          setLayout({
-            ...layout,
-            gates: layout.gates.filter((g) => g.id !== id),
-          });
+          setLayout({ ...layout, gates: layout.gates.filter((g) => g.id !== id) });
           setDirty(true);
         }}
-        onEditGateMeta={(id, patch) => {
+        onEditGateMeta={(id: string, patch: Partial<Gate>) => {
           pushUndo(layout);
           setLayout({
             ...layout,
@@ -231,5 +223,3 @@ export default function LayoutEditorPage() {
     </div>
   );
 }
-
-//ffsf
