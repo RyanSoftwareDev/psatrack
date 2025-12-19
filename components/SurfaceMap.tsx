@@ -81,12 +81,64 @@ function metersBetween(a: { lat: number; lon: number }, b: { lat: number; lon: n
  * Small airplane SVG marker that points "up" by default.
  * We rotate the container to match track degrees.
  */
-function makeAircraftIcon(trackDeg: number, onGround: boolean) {
-  const size = onGround ? 20 : 26;
+function makeAircraftIcon(trackDeg: number, color: string, onGround: boolean) {
+  const size = onGround ? 22 : 28;
   const rotation = Number.isFinite(trackDeg) ? trackDeg : 0;
 
-  const fill = onGround ? "rgba(168,85,247,0.95)" : "rgba(56,189,248,0.95)"; // matches your old colors
   const stroke = "rgba(15,23,42,0.95)";
+
+  // CRJ-ish top-down silhouette (nose points UP)
+  const svg = `
+  <svg viewBox="0 0 200 200" width="${size}" height="${size}">
+    <!-- fuselage -->
+    <path d="
+      M100 10
+      C112 10 122 20 122 32
+      L122 148
+      C122 160 112 170 100 170
+      C88 170 78 160 78 148
+      L78 32
+      C78 20 88 10 100 10
+      Z"
+      fill="${color}" stroke="${stroke}" stroke-width="6" stroke-linejoin="round"/>
+      
+    <!-- wings -->
+    <path d="
+      M30 92
+      L78 78
+      L78 106
+      L30 104
+      Z
+      M170 92
+      L122 78
+      L122 106
+      L170 104
+      Z"
+      fill="${color}" stroke="${stroke}" stroke-width="6" stroke-linejoin="round"/>
+
+    <!-- tailplane (T-tail vibe) -->
+    <path d="
+      M55 160
+      L78 150
+      L78 175
+      L55 178
+      Z
+      M145 160
+      L122 150
+      L122 175
+      L145 178
+      Z"
+      fill="${color}" stroke="${stroke}" stroke-width="6" stroke-linejoin="round"/>
+
+    <!-- vertical stab -->
+    <path d="
+      M92 140
+      L108 140
+      L120 188
+      L80 188
+      Z"
+      fill="${color}" stroke="${stroke}" stroke-width="6" stroke-linejoin="round"/>
+  </svg>`;
 
   const html = `
     <div style="
@@ -95,15 +147,7 @@ function makeAircraftIcon(trackDeg: number, onGround: boolean) {
       transform-origin: 50% 50%;
       filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
     ">
-      <svg viewBox="0 0 64 64" width="${size}" height="${size}">
-        <path
-          d="M32 2 L40 22 L58 28 L58 36 L40 34 L36 62 L28 62 L24 34 L6 36 L6 28 L24 22 Z"
-          fill="${fill}"
-          stroke="${stroke}"
-          stroke-width="2"
-          stroke-linejoin="round"
-        />
-      </svg>
+      ${svg}
     </div>
   `;
 
@@ -399,45 +443,51 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
           );
         })}
 
-        {/* Aircraft trails + aircraft icons */}
-        {aircraft.map((a, idx) => {
-          const lat = a?.lat;
-          const lon = a?.lon;
-          if (typeof lat !== "number" || typeof lon !== "number") return null;
+{/* Aircraft trails + aircraft icons */}
+{aircraft.map((a, idx) => {
+  const lat = a?.lat;
+  const lon = a?.lon;
+  if (typeof lat !== "number" || typeof lon !== "number") return null;
 
-          const key = (a?.icao24 ?? a?.callsign ?? `ac-${idx}`).toString();
-          const callsign = (a?.callsign ?? a?.icao24 ?? "Aircraft").toString();
+  const key = (a?.icao24 ?? a?.callsign ?? `ac-${idx}`).toString();
+  const callsign = (a?.callsign ?? a?.icao24 ?? "Aircraft").toString();
 
-          const velMs = typeof a?.velocity === "number" ? a.velocity : 0;
-          const kts = velMs * MS_TO_KTS;
+  const velMs = typeof a?.velocity === "number" ? a.velocity : 0;
+  const kts = velMs * MS_TO_KTS;
 
-          const onGround = !!a?.onGround;
-          const track = typeof a?.track === "number" ? a.track : 0;
+  const onGround = !!a?.onGround;
+  const track = typeof a?.track === "number" ? a.track : 0;
 
-          const trail = trailsRef.current[key] ?? [];
-          const showTrail = kts > TRAIL_MIN_KTS && trail.length >= 2;
+  const trail = trailsRef.current[key] ?? [];
+  const showTrail = kts > TRAIL_MIN_KTS && trail.length >= 2;
 
-          const icon = makeAircraftIcon(track, onGround);
+  // Pick a better color scheme (tweak these anytime)
+  const color = onGround
+    ? "rgba(168,85,247,0.95)"  // ground = purple
+    : "rgba(56,189,248,0.95)"; // air = blue
 
-          return (
-            <div key={key}>
-              {showTrail && (
-                <AnyPolyline
-                  positions={trail.map((p) => [p.lat, p.lon] as [number, number])}
-                  pathOptions={trailStyle}
-                />
-              )}
+  // Updated signature: makeAircraftIcon(trackDeg, color, onGround)
+  const icon = makeAircraftIcon(track, color, onGround);
 
-              <AnyMarker position={[lat, lon]} icon={icon}>
-                <AnyTooltip direction="top" offset={[0, -6]}>
-                  {callsign}
-                  {Number.isFinite(kts) ? ` • ${Math.round(kts)} kt` : ""}
-                  {onGround ? " • GND" : ""}
-                </AnyTooltip>
-              </AnyMarker>
-            </div>
-          );
-        })}
+  return (
+    <div key={key}>
+      {showTrail && (
+        <AnyPolyline
+          positions={trail.map((p) => [p.lat, p.lon] as [number, number])}
+          pathOptions={trailStyle}
+        />
+      )}
+
+      <AnyMarker position={[lat, lon]} icon={icon}>
+        <AnyTooltip direction="top" offset={[0, -6]}>
+          {callsign}
+          {Number.isFinite(kts) ? ` • ${Math.round(kts)} kt` : ""}
+          {onGround ? " • GND" : ""}
+        </AnyTooltip>
+      </AnyMarker>
+    </div>
+  );
+})}
 
         {/* Taxi nodes */}
         {layout.taxiGraph?.map((node) => (
