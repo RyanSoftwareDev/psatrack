@@ -1,18 +1,11 @@
 // app/api/aircraft/nearby/[icao]/route.ts
 import { NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
-import { getOpenSkyToken } from "@/lib/openskyAuth";
+import { getOpenSkyToken } from "@/lib/openskyAuth"; // bearer method (your working one)
 
 export const runtime = "nodejs";
 
 type Ctx = { params: Promise<{ icao: string }> };
-
-const memCache = new Map<string, { ts: number; payload: any }>();
-const MEM_CACHE_MS = 6_000;          // UI polls ~5s
-const FRESH_TTL_MS = 3_000;          // treat DB as “fresh” for 3s
-const FETCH_TIMEOUT_MS = 12_000;     // OpenSky should answer quickly
-const COOLDOWN_ON_FAIL_MS = 10_000;  // avoid hammering when OpenSky fails
-const DEFAULT_RADIUS_NM = 500;
 
 const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
   SAV: { icao: "KSAV", lat: 32.1270, lon: -81.2020 },
@@ -22,11 +15,26 @@ const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
   PHL: { icao: "KPHL", lat: 39.8744, lon: -75.2424 },
 };
 
-function isPsaAircraft(a: { callsign?: string | null }): boolean {
-  const cs = (a?.callsign ?? "").trim().toUpperCase();
-  return(
-    cs.startsWith("JIA")
-  );
+const DEFAULT_RADIUS_NM = 55;
+
+// --- “Best feel” thresholds (tune later) ---
+const MS_TO_KTS = 1.9438444924406;
+
+// Trails only when actually moving (your earlier request was > 5 kt)
+const TRAIL_MIN_KTS = 5;
+
+// When speed drops below this OR onGround=true → mark “landed”
+const LANDED_MAX_KTS = 10;
+
+// If we haven’t seen an aircraft for this long → mark “offline”
+const OFFLINE_AFTER_SEC = 120;
+
+// Don’t hammer OpenSky
+const FETCH_TIMEOUT_MS = 12_000;
+
+function isPsaCallsign(callsign?: string | null) {
+  const cs = (callsign ?? "").trim().toUpperCase();
+  return cs.startsWith("JIA");
 }
 
 function nmToKm(nm: number) {
@@ -37,161 +45,40 @@ function bboxFromCenter(lat: number, lon: number, radiusNm: number) {
   const rKm = nmToKm(radiusNm);
   const dLat = rKm / 111;
   const dLon = rKm / (111 * Math.cos((lat * Math.PI) / 180));
-
-  return {
-    lamin: lat - dLat,
-    lamax: lat + dLat,
-    lomin: lon - dLon,
-    lomax: lon + dLon,
-  };
-}
-
-function safeParsePayload(p: any): any | null {
-  if (!p) return null;
-  if (typeof p === "string") {
-    try {
-      return JSON.parse(p);
-    } catch {
-      return null;
-    }
-  }
-  return p;
+  return { lamin: lat - dLat, lamax: lat + dLat, lomin: lon - dLon, lomax: lon + dLon };
 }
 
 async function fetchWithTimeout(url: string, headers: Record<string, string>) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
   try {
-    return await fetch(url, {
-      method: "GET",
-      cache: "no-store",
-      signal: controller.signal,
-      headers,
-    });
+    return await fetch(url, { method: "GET", cache: "no-store", signal: controller.signal, headers });
   } finally {
     clearTimeout(t);
   }
 }
 
-async function readDbCache(base: string, radiusNm: number) {
-  const supabaseAdmin = getSupabaseAdmin();
-  const { data } = await supabaseAdmin
-    .from("aircraft_cache")
-    .select("*")
-    .eq("base_code", base)
-    .eq("radius_nm", radiusNm)
-    .maybeSingle();
-
-  return data ?? null;
-}
-
-async function writeDbCache(base: string, radiusNm: number, payload: any) {
-  const supabaseAdmin = getSupabaseAdmin();
-  await supabaseAdmin.from("aircraft_cache").upsert({
-    base_code: base,
-    radius_nm: radiusNm,
-    updated_at: new Date().toISOString(),
-    cooldown_until: null,
-    payload, // JSONB preferred
-  });
-}
-
-async function setCooldown(base: string, radiusNm: number, cachedPayload: any) {
-  const supabaseAdmin = getSupabaseAdmin();
-  const cooldownUntil = new Date(Date.now() + COOLDOWN_ON_FAIL_MS).toISOString();
-
-  await supabaseAdmin.from("aircraft_cache").upsert({
-    base_code: base,
-    radius_nm: radiusNm,
-    updated_at: new Date().toISOString(),
-    cooldown_until: cooldownUntil,
-    payload: cachedPayload ?? { airport: { code: base }, radiusNm, aircraft: [] },
-  });
+function isoFromOpenSkyLastContact(lastContact: any) {
+  // OpenSky lastContact is usually unix seconds
+  if (typeof lastContact === "number" && Number.isFinite(lastContact) && lastContact > 0) {
+    return new Date(lastContact * 1000).toISOString();
+  }
+  return new Date().toISOString();
 }
 
 export async function GET(req: Request, { params }: Ctx) {
   const { icao } = await params;
   const key = (icao || "").toUpperCase().trim();
   const airport = AIRPORTS[key];
-
-  if (!airport) {
-    return NextResponse.json({ error: "Unknown airport" }, { status: 404 });
-  }
+  if (!airport) return NextResponse.json({ error: "Unknown airport" }, { status: 404 });
 
   const url = new URL(req.url);
   const radiusNmRaw = Number(url.searchParams.get("radiusNm") ?? DEFAULT_RADIUS_NM);
   const radiusNm = Number.isFinite(radiusNmRaw) ? radiusNmRaw : DEFAULT_RADIUS_NM;
 
-  const force = url.searchParams.get("force") === "1";
+  const force = url.searchParams.get("force") === "1"; // bypass any future cache logic
   const debug = url.searchParams.get("debug") === "1";
 
-  const cacheKey = `${key}:${radiusNm.toFixed(2)}`;
-
-  // 0) In-memory cache (skip when force=1)
-  if (!force) {
-    const mem = memCache.get(cacheKey);
-    if (mem && Date.now() - mem.ts < MEM_CACHE_MS) {
-      return NextResponse.json(mem.payload, {
-        headers: { "Cache-Control": "s-maxage=5, stale-while-revalidate=10" },
-      });
-    }
-  }
-
-  // 1) DB cache (skip when force=1)
-  let dbCached: any = null;
-  let cachedPayload: any = null;
-
-  if (!force) {
-    try {
-      dbCached = await readDbCache(key, radiusNm);
-      cachedPayload = safeParsePayload(dbCached?.payload);
-    } catch {
-      dbCached = null;
-      cachedPayload = null;
-    }
-
-    const now = Date.now();
-    const dbUpdatedMs = dbCached?.updated_at ? new Date(dbCached.updated_at).getTime() : 0;
-    const dbIsFresh = !!dbCached && now - dbUpdatedMs < FRESH_TTL_MS;
-
-    const cooldownUntilMs = dbCached?.cooldown_until ? new Date(dbCached.cooldown_until).getTime() : 0;
-    const inCooldown = !!cooldownUntilMs && now < cooldownUntilMs;
-
-    const cacheMatchesRadius =
-      typeof cachedPayload?.radiusNm === "number" &&
-      Math.abs(cachedPayload.radiusNm - radiusNm) < 0.001;
-
-    if (cachedPayload && cacheMatchesRadius && (dbIsFresh || inCooldown)) {
-      const filteredAircraft = Array.isArray(cachedPayload.aircraft)
-        ? cachedPayload.aircraft.filter(isPsaAircraft)
-        : [];
-
-      const payload = {
-        ...cachedPayload,
-        aircraft: filteredAircraft,
-        stale: !dbIsFresh,
-        source: dbIsFresh ? "cache_fresh" : "cache_cooldown",
-        updatedAt: dbCached.updated_at,
-      };
-
-      memCache.set(cacheKey, { ts: Date.now(), payload });
-      return NextResponse.json(payload);
-    }
-  }
-
-  // Always load DB once for fallback (even when force=1)
-  if (!dbCached) {
-    try {
-      dbCached = await readDbCache(key, radiusNm);
-      cachedPayload = safeParsePayload(dbCached?.payload);
-    } catch {
-      dbCached = null;
-      cachedPayload = null;
-    }
-  }
-
-  // 2) OpenSky bbox fetch
   const { lamin, lomin, lamax, lomax } = bboxFromCenter(airport.lat, airport.lon, radiusNm);
 
   const openskyUrl =
@@ -202,141 +89,177 @@ export async function GET(req: Request, { params }: Ctx) {
     `&lomax=${encodeURIComponent(lomax)}` +
     `&extended=1`;
 
+  const supabaseAdmin = getSupabaseAdmin();
+
   try {
-    // Get token, call OpenSky
+    // 1) Fetch OpenSky (Bearer token)
     const token = await getOpenSkyToken();
-    let response = await fetchWithTimeout(openskyUrl, {
+    const response = await fetchWithTimeout(openskyUrl, {
       "User-Agent": "psatrack/0.1 (contact: you)",
       Authorization: `Bearer ${token}`,
     });
 
-    // Retry once on 401 with forced fresh token
-    if (response.status === 401) {
-      const fresh = await getOpenSkyToken({ forceRefresh: true });
-      response = await fetchWithTimeout(openskyUrl, {
-        "User-Agent": "psatrack/0.1 (contact: you)",
-        Authorization: `Bearer ${fresh}`,
-      });
-    }
-
+    // Optional: debug “are we really hitting OpenSky?”
     if (debug) {
       const bodyText = await response.text().catch(() => "");
       return NextResponse.json({
         usingAuth: "bearer",
         openskyUrl,
         status: response.status,
-        statusText: response.statusText,
-        bodySnippet: bodyText.slice(0, 300),
+        bodySnippet: bodyText.slice(0, 400),
       });
     }
 
     if (!response.ok) {
-      const fallbackBase =
-        cachedPayload ?? { airport: { code: key, ...airport }, radiusNm, aircraft: [] };
+      // return current DB state if OpenSky fails
+      const { data: latest } = await supabaseAdmin
+        .from("aircraft_latest")
+        .select("*")
+        .eq("base_code", key)
+        .order("last_seen", { ascending: false })
+        .limit(250);
 
-      const fallback = {
-        ...fallbackBase,
+      return NextResponse.json({
         airport: { code: key, ...airport },
         radiusNm,
-        aircraft: Array.isArray(fallbackBase.aircraft)
-          ? fallbackBase.aircraft.filter(isPsaAircraft)
-          : [],
-      };
-
-      if (!force) {
-        try {
-          await setCooldown(key, radiusNm, fallback);
-        } catch {}
-      }
-
-      const payload = {
-        ...fallback,
+        aircraft: latest ?? [],
         stale: true,
         source: `opensky_http_${response.status}`,
-        updatedAt: dbCached?.updated_at ?? null,
-      };
-
-      memCache.set(cacheKey, { ts: Date.now(), payload });
-      return NextResponse.json(payload, { status: 200 });
+        updatedAt: new Date().toISOString(),
+      });
     }
 
-    const data = await response.json().catch(() => ({} as any));
+    const data = await response.json();
     const states: any[] = Array.isArray(data?.states) ? data.states : [];
 
-    const aircraft = states
+    // 2) Normalize → PSA only (JIA)
+    const nowIso = new Date().toISOString();
+
+    const normalized = states
       .map((s) => {
         const icao24 = s?.[0] ?? null;
         const callsignRaw = typeof s?.[1] === "string" ? s[1].trim().toUpperCase() : "";
         const lon = s?.[5];
         const lat = s?.[6];
         const onGround = !!s?.[8];
-        const velocityMs = s?.[9] ?? null;
-        const track = s?.[10] ?? null;
-        const lastContact = s?.[4] ?? null;
+        const velMs = typeof s?.[9] === "number" ? s[9] : 0;
+        const track = typeof s?.[10] === "number" ? s[10] : null;
+        const lastContact = s?.[4];
 
-        if (typeof lat !== "number" || typeof lon !== "number") return null;
+        if (!icao24 || typeof lat !== "number" || typeof lon !== "number") return null;
+        if (!isPsaCallsign(callsignRaw)) return null;
+
+        const kts = velMs * MS_TO_KTS;
+
+        const status =
+          onGround || kts <= LANDED_MAX_KTS
+            ? "landed"
+            : "active";
 
         return {
-          icao24,
+          icao24: String(icao24),
           callsign: callsignRaw || null,
           lat,
           lon,
-          onGround,
-          velocity: velocityMs,
           track,
-          lastContact,
+          onGround,
+          ground_speed_kt: Number.isFinite(kts) ? kts : null,
+          last_seen: isoFromOpenSkyLastContact(lastContact),
+          status,
           source: "opensky",
+          updated_at: nowIso,
+          base_code: key,
         };
       })
-      .filter((a): a is NonNullable<typeof a> => !!a)
-      .filter(isPsaAircraft);
+      .filter((x): x is NonNullable<typeof x> => !!x);
 
-    const payload = {
-      airport: { code: key, ...airport },
-      radiusNm,
-      aircraft,
-      stale: false,
-      source: "opensky_live",
-      updatedAt: new Date().toISOString(),
-    };
-
-    try {
-      await writeDbCache(key, radiusNm, payload);
-    } catch {}
-
-    memCache.set(cacheKey, { ts: Date.now(), payload });
-
-    return NextResponse.json(payload, {
-      headers: { "Cache-Control": "s-maxage=5, stale-while-revalidate=10" },
-    });
-  } catch (err: any) {
-    const fallbackBase =
-      cachedPayload ?? { airport: { code: key, ...airport }, radiusNm, aircraft: [] };
-
-    const fallback = {
-      ...fallbackBase,
-      airport: { code: key, ...airport },
-      radiusNm,
-      aircraft: Array.isArray(fallbackBase.aircraft)
-        ? fallbackBase.aircraft.filter(isPsaAircraft)
-        : [],
-    };
-
-    if (!force) {
-      try {
-        await setCooldown(key, radiusNm, fallback);
-      } catch {}
+    // 3) Write current snapshots (bulk upsert)
+    // NOTE: aircraft_latest primary key is icao24
+    if (normalized.length > 0) {
+      await supabaseAdmin.from("aircraft_latest").upsert(
+        normalized.map((a) => ({
+          icao24: a.icao24,
+          base_code: a.base_code,
+          callsign: a.callsign,
+          last_seen: a.last_seen,
+          lat: a.lat,
+          lon: a.lon,
+          track: a.track,
+          ground_speed_kt: a.ground_speed_kt,
+          on_ground: a.onGround,
+          status: a.status,
+          source: a.source,
+          updated_at: a.updated_at,
+        })),
+        { onConflict: "icao24" }
+      );
     }
 
-    const payload = {
-      ...fallback,
+    // 4) Insert trail points (bulk) ONLY if moving > TRAIL_MIN_KTS
+    // This keeps the DB smaller and matches your “trail only when speed > 5kt” rule.
+    const trailRows = normalized
+      .filter((a) => (a.ground_speed_kt ?? 0) > TRAIL_MIN_KTS)
+      .map((a) => ({
+        base_code: key,
+        icao24: a.icao24,
+        callsign: a.callsign,
+        ts: a.last_seen, // keeps trail aligned with ADS-B time
+        lat: a.lat,
+        lon: a.lon,
+        track: a.track,
+        ground_speed_kt: a.ground_speed_kt,
+        on_ground: a.onGround,
+        source: "opensky",
+      }));
+
+    if (trailRows.length > 0) {
+      await supabaseAdmin.from("aircraft_track_points").insert(trailRows);
+    }
+
+    // 5) Mark OFFLINE: anything not seen recently becomes offline
+    // This is how you keep “landed/adsb-off” aircraft on the map in a different color.
+    const cutoffIso = new Date(Date.now() - OFFLINE_AFTER_SEC * 1000).toISOString();
+
+    await supabaseAdmin
+      .from("aircraft_latest")
+      .update({ status: "offline", updated_at: nowIso })
+      .eq("base_code", key)
+      .lt("last_seen", cutoffIso)
+      .neq("status", "offline");
+
+    // 6) Return “current state” from DB (fast + consistent)
+    const { data: latest } = await supabaseAdmin
+      .from("aircraft_latest")
+      .select("*")
+      .eq("base_code", key)
+      .order("last_seen", { ascending: false })
+      .limit(250);
+
+    return NextResponse.json({
+      airport: { code: key, ...airport },
+      radiusNm,
+      aircraft: latest ?? [],
+      stale: false,
+      source: "opensky_live",
+      updatedAt: nowIso,
+    });
+  } catch (err: any) {
+    // fallback: return DB state
+    const { data: latest } = await supabaseAdmin
+      .from("aircraft_latest")
+      .select("*")
+      .eq("base_code", key)
+      .order("last_seen", { ascending: false })
+      .limit(250);
+
+    return NextResponse.json({
+      airport: { code: key, ...airport },
+      radiusNm,
+      aircraft: latest ?? [],
       stale: true,
       source: "cache_fetch_failed",
       error: (err?.message ?? "unknown_error").toString().slice(0, 200),
-      updatedAt: dbCached?.updated_at ?? null,
-    };
-
-    memCache.set(cacheKey, { ts: Date.now(), payload });
-    return NextResponse.json(payload, { status: 200 });
+      updatedAt: new Date().toISOString(),
+    });
   }
 }
