@@ -13,8 +13,10 @@ const TOKEN_URL =
   "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
 
 /**
- * Gets an OAuth2 client-credentials token from OpenSky.
- * Token is cached in-memory per serverless instance.
+ * OAuth2 Client Credentials (recommended by OpenSky).
+ * Requires:
+ *  - OPENSKY_CLIENT_ID (e.g. "...-api-client")
+ *  - OPENSKY_CLIENT_SECRET
  */
 export async function getOpenSkyToken(opts?: { forceRefresh?: boolean }): Promise<string> {
   const now = Date.now();
@@ -23,7 +25,7 @@ export async function getOpenSkyToken(opts?: { forceRefresh?: boolean }): Promis
     return cached.token;
   }
 
-  const client_id = requireEnv("OPENSKY_CLIENT_ID");
+  const client_id = requireEnv("OPENSKY_CLIENT_ID").trim();
   const client_secret = requireEnv("OPENSKY_CLIENT_SECRET");
 
   const body = new URLSearchParams({

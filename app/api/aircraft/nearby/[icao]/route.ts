@@ -5,8 +5,14 @@ import { getOpenSkyToken } from "@/lib/openskyAuth";
 
 export const runtime = "nodejs";
 
+type Ctx = { params: Promise<{ icao: string }> };
+
 const memCache = new Map<string, { ts: number; payload: any }>();
-const MEM_CACHE_MS = 6000; // UI polls ~5s
+const MEM_CACHE_MS = 6_000;          // UI polls ~5s
+const FRESH_TTL_MS = 3_000;          // treat DB as “fresh” for 3s
+const FETCH_TIMEOUT_MS = 12_000;     // OpenSky should answer quickly
+const COOLDOWN_ON_FAIL_MS = 10_000;  // avoid hammering when OpenSky fails
+const DEFAULT_RADIUS_NM = 500;
 
 const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
   SAV: { icao: "KSAV", lat: 32.1270, lon: -81.2020 },
@@ -16,16 +22,12 @@ const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
   PHL: { icao: "KPHL", lat: 39.8744, lon: -75.2424 },
 };
 
-type Ctx = { params: Promise<{ icao: string }> };
-
-const DEFAULT_RADIUS_NM = 500;
-const FRESH_TTL_MS = 15_000;
-const FETCH_TIMEOUT_MS = 9_000;
-const COOLDOWN_ON_FAIL_MS = 30_000;
-
 function isPsaAircraft(a: { callsign?: string | null }): boolean {
   const cs = (a?.callsign ?? "").trim().toUpperCase();
-  return cs.startsWith("JIA");
+  return(
+    cs.startsWith("JIA")
+    
+  );
 }
 
 function nmToKm(nm: number) {
@@ -36,6 +38,7 @@ function bboxFromCenter(lat: number, lon: number, radiusNm: number) {
   const rKm = nmToKm(radiusNm);
   const dLat = rKm / 111;
   const dLon = rKm / (111 * Math.cos((lat * Math.PI) / 180));
+
   return {
     lamin: lat - dLat,
     lamax: lat + dLat,
@@ -44,37 +47,16 @@ function bboxFromCenter(lat: number, lon: number, radiusNm: number) {
   };
 }
 
-async function readDbCache(base: string) {
-  const supabaseAdmin = getSupabaseAdmin();
-  const { data } = await supabaseAdmin
-    .from("aircraft_cache")
-    .select("*")
-    .eq("base_code", base)
-    .maybeSingle();
-  return data ?? null;
-}
-
-async function writeDbCache(base: string, payload: any) {
-  const supabaseAdmin = getSupabaseAdmin();
-  await supabaseAdmin.from("aircraft_cache").upsert({
-    base_code: base,
-    updated_at: new Date().toISOString(),
-    cooldown_until: null,
-    payload,
-  });
-}
-
-async function setCooldown(base: string, cachedPayload: any) {
-  const supabaseAdmin = getSupabaseAdmin();
-  const cooldownUntil = new Date(Date.now() + COOLDOWN_ON_FAIL_MS).toISOString();
-
-  await supabaseAdmin.from("aircraft_cache").upsert({
-    base_code: base,
-    updated_at: new Date().toISOString(),
-    cooldown_until: cooldownUntil,
-    payload:
-      cachedPayload ?? { airport: { code: base }, radiusNm: null, aircraft: [] },
-  });
+function safeParsePayload(p: any): any | null {
+  if (!p) return null;
+  if (typeof p === "string") {
+    try {
+      return JSON.parse(p);
+    } catch {
+      return null;
+    }
+  }
+  return p;
 }
 
 async function fetchWithTimeout(url: string, headers: Record<string, string>) {
@@ -83,6 +65,7 @@ async function fetchWithTimeout(url: string, headers: Record<string, string>) {
 
   try {
     return await fetch(url, {
+      method: "GET",
       cache: "no-store",
       signal: controller.signal,
       headers,
@@ -90,6 +73,42 @@ async function fetchWithTimeout(url: string, headers: Record<string, string>) {
   } finally {
     clearTimeout(t);
   }
+}
+
+async function readDbCache(base: string, radiusNm: number) {
+  const supabaseAdmin = getSupabaseAdmin();
+  const { data } = await supabaseAdmin
+    .from("aircraft_cache")
+    .select("*")
+    .eq("base_code", base)
+    .eq("radius_nm", radiusNm)
+    .maybeSingle();
+
+  return data ?? null;
+}
+
+async function writeDbCache(base: string, radiusNm: number, payload: any) {
+  const supabaseAdmin = getSupabaseAdmin();
+  await supabaseAdmin.from("aircraft_cache").upsert({
+    base_code: base,
+    radius_nm: radiusNm,
+    updated_at: new Date().toISOString(),
+    cooldown_until: null,
+    payload, // JSONB preferred
+  });
+}
+
+async function setCooldown(base: string, radiusNm: number, cachedPayload: any) {
+  const supabaseAdmin = getSupabaseAdmin();
+  const cooldownUntil = new Date(Date.now() + COOLDOWN_ON_FAIL_MS).toISOString();
+
+  await supabaseAdmin.from("aircraft_cache").upsert({
+    base_code: base,
+    radius_nm: radiusNm,
+    updated_at: new Date().toISOString(),
+    cooldown_until: cooldownUntil,
+    payload: cachedPayload ?? { airport: { code: base }, radiusNm, aircraft: [] },
+  });
 }
 
 export async function GET(req: Request, { params }: Ctx) {
@@ -105,54 +124,76 @@ export async function GET(req: Request, { params }: Ctx) {
   const radiusNmRaw = Number(url.searchParams.get("radiusNm") ?? DEFAULT_RADIUS_NM);
   const radiusNm = Number.isFinite(radiusNmRaw) ? radiusNmRaw : DEFAULT_RADIUS_NM;
 
+  const force = url.searchParams.get("force") === "1";
+  const debug = url.searchParams.get("debug") === "1";
+
   const cacheKey = `${key}:${radiusNm.toFixed(2)}`;
 
-  // 0) in-memory cache
-  const mem = memCache.get(cacheKey);
-  if (mem && Date.now() - mem.ts < MEM_CACHE_MS) {
-    return NextResponse.json(mem.payload, {
-      headers: { "Cache-Control": "s-maxage=5, stale-while-revalidate=10" },
-    });
+  // 0) In-memory cache (skip when force=1)
+  if (!force) {
+    const mem = memCache.get(cacheKey);
+    if (mem && Date.now() - mem.ts < MEM_CACHE_MS) {
+      return NextResponse.json(mem.payload, {
+        headers: { "Cache-Control": "s-maxage=5, stale-while-revalidate=10" },
+      });
+    }
   }
 
-  // 1) DB cache
+  // 1) DB cache (skip when force=1)
   let dbCached: any = null;
-  try {
-    dbCached = await readDbCache(key);
-  } catch {}
+  let cachedPayload: any = null;
 
-  const now = Date.now();
-  const dbUpdated = dbCached?.updated_at ? new Date(dbCached.updated_at).getTime() : 0;
-  const dbIsFresh = !!dbCached && now - dbUpdated < FRESH_TTL_MS;
+  if (!force) {
+    try {
+      dbCached = await readDbCache(key, radiusNm);
+      cachedPayload = safeParsePayload(dbCached?.payload);
+    } catch {
+      dbCached = null;
+      cachedPayload = null;
+    }
 
-  const cooldownUntil = dbCached?.cooldown_until
-    ? new Date(dbCached.cooldown_until).getTime()
-    : 0;
-  const inCooldown = cooldownUntil && now < cooldownUntil;
+    const now = Date.now();
+    const dbUpdatedMs = dbCached?.updated_at ? new Date(dbCached.updated_at).getTime() : 0;
+    const dbIsFresh = !!dbCached && now - dbUpdatedMs < FRESH_TTL_MS;
 
-  if ((dbIsFresh || inCooldown) && dbCached?.payload) {
-    const filteredAircraft = Array.isArray(dbCached.payload?.aircraft)
-      ? dbCached.payload.aircraft.filter(isPsaAircraft)
-      : [];
+    const cooldownUntilMs = dbCached?.cooldown_until ? new Date(dbCached.cooldown_until).getTime() : 0;
+    const inCooldown = !!cooldownUntilMs && now < cooldownUntilMs;
 
-    const payload = {
-      ...dbCached.payload,
-      aircraft: filteredAircraft,
-      stale: !dbIsFresh,
-      source: dbIsFresh ? "cache_fresh" : "cache_cooldown",
-      updatedAt: dbCached.updated_at,
-    };
+    const cacheMatchesRadius =
+      typeof cachedPayload?.radiusNm === "number" &&
+      Math.abs(cachedPayload.radiusNm - radiusNm) < 0.001;
 
-    memCache.set(cacheKey, { ts: Date.now(), payload });
-    return NextResponse.json(payload);
+    if (cachedPayload && cacheMatchesRadius && (dbIsFresh || inCooldown)) {
+      const filteredAircraft = Array.isArray(cachedPayload.aircraft)
+        ? cachedPayload.aircraft.filter(isPsaAircraft)
+        : [];
+
+      const payload = {
+        ...cachedPayload,
+        aircraft: filteredAircraft,
+        stale: !dbIsFresh,
+        source: dbIsFresh ? "cache_fresh" : "cache_cooldown",
+        updatedAt: dbCached.updated_at,
+      };
+
+      memCache.set(cacheKey, { ts: Date.now(), payload });
+      return NextResponse.json(payload);
+    }
   }
 
-  // 2) OpenSky bbox
-  const { lamin, lomin, lamax, lomax } = bboxFromCenter(
-    airport.lat,
-    airport.lon,
-    radiusNm
-  );
+  // Always load DB once for fallback (even when force=1)
+  if (!dbCached) {
+    try {
+      dbCached = await readDbCache(key, radiusNm);
+      cachedPayload = safeParsePayload(dbCached?.payload);
+    } catch {
+      dbCached = null;
+      cachedPayload = null;
+    }
+  }
+
+  // 2) OpenSky bbox fetch
+  const { lamin, lomin, lamax, lomax } = bboxFromCenter(airport.lat, airport.lon, radiusNm);
 
   const openskyUrl =
     `https://opensky-network.org/api/states/all` +
@@ -163,47 +204,56 @@ export async function GET(req: Request, { params }: Ctx) {
     `&extended=1`;
 
   try {
-    // First try with cached token
+    // Get token, call OpenSky
     const token = await getOpenSkyToken();
-
     let response = await fetchWithTimeout(openskyUrl, {
       "User-Agent": "psatrack/0.1 (contact: you)",
       Authorization: `Bearer ${token}`,
     });
 
-    // ✅ Retry once on 401 with a FORCED fresh token
+    // Retry once on 401 with forced fresh token
     if (response.status === 401) {
-      const freshToken = await getOpenSkyToken({ forceRefresh: true });
-
+      const fresh = await getOpenSkyToken({ forceRefresh: true });
       response = await fetchWithTimeout(openskyUrl, {
         "User-Agent": "psatrack/0.1 (contact: you)",
-        Authorization: `Bearer ${freshToken}`,
+        Authorization: `Bearer ${fresh}`,
+      });
+    }
+
+    if (debug) {
+      const bodyText = await response.text().catch(() => "");
+      return NextResponse.json({
+        usingAuth: "bearer",
+        openskyUrl,
+        status: response.status,
+        statusText: response.statusText,
+        bodySnippet: bodyText.slice(0, 300),
       });
     }
 
     if (!response.ok) {
-      const fallbackRaw =
-        dbCached?.payload ?? {
-          airport: { code: key, ...airport },
-          radiusNm,
-          aircraft: [],
-        };
+      const fallbackBase =
+        cachedPayload ?? { airport: { code: key, ...airport }, radiusNm, aircraft: [] };
 
       const fallback = {
-        ...fallbackRaw,
-        aircraft: Array.isArray(fallbackRaw.aircraft)
-          ? fallbackRaw.aircraft.filter(isPsaAircraft)
+        ...fallbackBase,
+        airport: { code: key, ...airport },
+        radiusNm,
+        aircraft: Array.isArray(fallbackBase.aircraft)
+          ? fallbackBase.aircraft.filter(isPsaAircraft)
           : [],
       };
 
-      try {
-        await setCooldown(key, fallback);
-      } catch {}
+      if (!force) {
+        try {
+          await setCooldown(key, radiusNm, fallback);
+        } catch {}
+      }
 
       const payload = {
         ...fallback,
         stale: true,
-        source: `cache_http_${response.status}`,
+        source: `opensky_http_${response.status}`,
         updatedAt: dbCached?.updated_at ?? null,
       };
 
@@ -211,14 +261,13 @@ export async function GET(req: Request, { params }: Ctx) {
       return NextResponse.json(payload, { status: 200 });
     }
 
-    const data = await response.json();
+    const data = await response.json().catch(() => ({} as any));
     const states: any[] = Array.isArray(data?.states) ? data.states : [];
 
     const aircraft = states
       .map((s) => {
         const icao24 = s?.[0] ?? null;
-        const callsignRaw =
-          typeof s?.[1] === "string" ? s[1].trim().toUpperCase() : "";
+        const callsignRaw = typeof s?.[1] === "string" ? s[1].trim().toUpperCase() : "";
         const lon = s?.[5];
         const lat = s?.[6];
         const onGround = !!s?.[8];
@@ -253,7 +302,7 @@ export async function GET(req: Request, { params }: Ctx) {
     };
 
     try {
-      await writeDbCache(key, payload);
+      await writeDbCache(key, radiusNm, payload);
     } catch {}
 
     memCache.set(cacheKey, { ts: Date.now(), payload });
@@ -261,29 +310,30 @@ export async function GET(req: Request, { params }: Ctx) {
     return NextResponse.json(payload, {
       headers: { "Cache-Control": "s-maxage=5, stale-while-revalidate=10" },
     });
-  } catch {
-    const fallbackRaw =
-      dbCached?.payload ?? {
-        airport: { code: key, ...airport },
-        radiusNm,
-        aircraft: [],
-      };
+  } catch (err: any) {
+    const fallbackBase =
+      cachedPayload ?? { airport: { code: key, ...airport }, radiusNm, aircraft: [] };
 
     const fallback = {
-      ...fallbackRaw,
-      aircraft: Array.isArray(fallbackRaw.aircraft)
-        ? fallbackRaw.aircraft.filter(isPsaAircraft)
+      ...fallbackBase,
+      airport: { code: key, ...airport },
+      radiusNm,
+      aircraft: Array.isArray(fallbackBase.aircraft)
+        ? fallbackBase.aircraft.filter(isPsaAircraft)
         : [],
     };
 
-    try {
-      await setCooldown(key, fallback);
-    } catch {}
+    if (!force) {
+      try {
+        await setCooldown(key, radiusNm, fallback);
+      } catch {}
+    }
 
     const payload = {
       ...fallback,
       stale: true,
       source: "cache_fetch_failed",
+      error: (err?.message ?? "unknown_error").toString().slice(0, 200),
       updatedAt: dbCached?.updated_at ?? null,
     };
 
