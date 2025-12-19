@@ -3,18 +3,28 @@ type TokenResp = { access_token: string; expires_in?: number };
 
 let cached: { token: string; exp: number } | null = null;
 
-function need(name: string) {
+function requireEnv(name: string): string {
   const v = process.env[name];
-  if (!v) throw new Error(`${name} missing`);
+  if (!v) throw new Error(`${name} is missing`);
   return v;
 }
 
-export async function getOpenSkyToken(): Promise<string> {
-  const now = Date.now();
-  if (cached && now < cached.exp) return cached.token;
+const TOKEN_URL =
+  "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
 
-  const client_id = need("gavin.ryan.amtsec@gmail.com-api-client");
-  const client_secret = need("GeAOKyoYkC4bwgaI74Z6fSKk1pxbiId6");
+/**
+ * Gets an OAuth2 client-credentials token from OpenSky.
+ * Token is cached in-memory per serverless instance.
+ */
+export async function getOpenSkyToken(opts?: { forceRefresh?: boolean }): Promise<string> {
+  const now = Date.now();
+
+  if (!opts?.forceRefresh && cached && now < cached.exp) {
+    return cached.token;
+  }
+
+  const client_id = requireEnv("OPENSKY_CLIENT_ID");
+  const client_secret = requireEnv("OPENSKY_CLIENT_SECRET");
 
   const body = new URLSearchParams({
     grant_type: "client_credentials",
@@ -22,15 +32,12 @@ export async function getOpenSkyToken(): Promise<string> {
     client_secret,
   });
 
-  const res = await fetch(
-    "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
-      cache: "no-store",
-    }
-  );
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+    cache: "no-store",
+  });
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -39,8 +46,9 @@ export async function getOpenSkyToken(): Promise<string> {
 
   const json = (await res.json()) as TokenResp;
 
-  // expire a bit early to avoid edge-of-expiry 401s
+  // expire early to avoid edge-of-expiry 401s
   const ttlMs = Math.max(60, (json.expires_in ?? 1800) - 60) * 1000;
   cached = { token: json.access_token, exp: now + ttlMs };
+
   return cached.token;
 }

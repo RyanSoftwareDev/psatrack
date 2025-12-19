@@ -19,13 +19,13 @@ const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
 type Ctx = { params: Promise<{ icao: string }> };
 
 const DEFAULT_RADIUS_NM = 500;
-const FRESH_TTL_MS = 15_000; // DB cache freshness window
-const FETCH_TIMEOUT_MS = 9_000; // keep under serverless pain
+const FRESH_TTL_MS = 15_000;
+const FETCH_TIMEOUT_MS = 9_000;
 const COOLDOWN_ON_FAIL_MS = 30_000;
 
 function isPsaAircraft(a: { callsign?: string | null }): boolean {
   const cs = (a?.callsign ?? "").trim().toUpperCase();
-  return cs.startsWith("JIA"); // PSA callsign prefix
+  return cs.startsWith("JIA");
 }
 
 function nmToKm(nm: number) {
@@ -77,6 +77,21 @@ async function setCooldown(base: string, cachedPayload: any) {
   });
 }
 
+async function fetchWithTimeout(url: string, headers: Record<string, string>) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    return await fetch(url, {
+      cache: "no-store",
+      signal: controller.signal,
+      headers,
+    });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export async function GET(req: Request, { params }: Ctx) {
   const { icao } = await params;
   const key = (icao || "").toUpperCase().trim();
@@ -92,7 +107,7 @@ export async function GET(req: Request, { params }: Ctx) {
 
   const cacheKey = `${key}:${radiusNm.toFixed(2)}`;
 
-  // 0) small in-memory cache (reduces hammering)
+  // 0) in-memory cache
   const mem = memCache.get(cacheKey);
   if (mem && Date.now() - mem.ts < MEM_CACHE_MS) {
     return NextResponse.json(mem.payload, {
@@ -100,13 +115,11 @@ export async function GET(req: Request, { params }: Ctx) {
     });
   }
 
-  // 1) DB cache (Supabase)
+  // 1) DB cache
   let dbCached: any = null;
   try {
     dbCached = await readDbCache(key);
-  } catch {
-    // ignore DB read issues, we’ll try OpenSky anyway
-  }
+  } catch {}
 
   const now = Date.now();
   const dbUpdated = dbCached?.updated_at ? new Date(dbCached.updated_at).getTime() : 0;
@@ -117,7 +130,6 @@ export async function GET(req: Request, { params }: Ctx) {
     : 0;
   const inCooldown = cooldownUntil && now < cooldownUntil;
 
-  // If DB cache is fresh or in cooldown, serve it immediately
   if ((dbIsFresh || inCooldown) && dbCached?.payload) {
     const filteredAircraft = Array.isArray(dbCached.payload?.aircraft)
       ? dbCached.payload.aircraft.filter(isPsaAircraft)
@@ -135,7 +147,7 @@ export async function GET(req: Request, { params }: Ctx) {
     return NextResponse.json(payload);
   }
 
-  // 2) Live OpenSky fetch (OAuth)
+  // 2) OpenSky bbox
   const { lamin, lomin, lamax, lomax } = bboxFromCenter(
     airport.lat,
     airport.lon,
@@ -151,31 +163,22 @@ export async function GET(req: Request, { params }: Ctx) {
     `&extended=1`;
 
   try {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    // First try with cached token
+    const token = await getOpenSkyToken();
 
-    let response = await fetch(openskyUrl, {
-      cache: "no-store",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "psatrack/0.1 (contact: you)",
-        Authorization: `Bearer ${await getOpenSkyToken()}`,
-      },
-    }).finally(() => clearTimeout(t));
+    let response = await fetchWithTimeout(openskyUrl, {
+      "User-Agent": "psatrack/0.1 (contact: you)",
+      Authorization: `Bearer ${token}`,
+    });
 
-    // Retry once on 401 (token issues)
+    // ✅ Retry once on 401 with a FORCED fresh token
     if (response.status === 401) {
-      const controller2 = new AbortController();
-      const t2 = setTimeout(() => controller2.abort(), FETCH_TIMEOUT_MS);
+      const freshToken = await getOpenSkyToken({ forceRefresh: true });
 
-      response = await fetch(openskyUrl, {
-        cache: "no-store",
-        signal: controller2.signal,
-        headers: {
-          "User-Agent": "psatrack/0.1 (contact: you)",
-          Authorization: `Bearer ${await getOpenSkyToken()}`,
-        },
-      }).finally(() => clearTimeout(t2));
+      response = await fetchWithTimeout(openskyUrl, {
+        "User-Agent": "psatrack/0.1 (contact: you)",
+        Authorization: `Bearer ${freshToken}`,
+      });
     }
 
     if (!response.ok) {
@@ -193,7 +196,6 @@ export async function GET(req: Request, { params }: Ctx) {
           : [],
       };
 
-      // Set cooldown so prod stops hammering
       try {
         await setCooldown(key, fallback);
       } catch {}
@@ -250,7 +252,6 @@ export async function GET(req: Request, { params }: Ctx) {
       updatedAt: new Date().toISOString(),
     };
 
-    // write-through cache
     try {
       await writeDbCache(key, payload);
     } catch {}
@@ -261,7 +262,6 @@ export async function GET(req: Request, { params }: Ctx) {
       headers: { "Cache-Control": "s-maxage=5, stale-while-revalidate=10" },
     });
   } catch {
-    // timeout/connect fail — serve cached if possible + cooldown
     const fallbackRaw =
       dbCached?.payload ?? {
         airport: { code: key, ...airport },
