@@ -25,8 +25,12 @@ const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
 function isPsaAircraft(a: { callsign?: string | null }): boolean {
   const cs = (a?.callsign ?? "").trim().toUpperCase();
   return(
-    cs.startsWith("JIA")
-    
+    cs.startsWith("JIA") ||     // PSA ICAO callsign
+    cs.startsWith("AAL") ||     // American (sometimes appears)
+    cs.startsWith("ASH") ||     // Mesa (example of regionals)
+    cs.startsWith("ENY") ||     // Envoy
+    cs.startsWith("PDT") ||     // Piedmont
+    cs.startsWith("AWI")
   );
 }
 
