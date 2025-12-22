@@ -53,17 +53,23 @@ type SurfaceMapProps = {
 };
 
 // ---- Trail + aircraft rendering helpers ----
-type TrailPoint = { lat: number; lon: number; t: number };
+type TrailPoint = { lat: number; lon: number; t: number }; // t = epoch ms
 type TrailMap = Record<string, TrailPoint[]>;
 
-const MS_TO_KTS = 1.943844;
-const TRAIL_MIN_KTS = 5;
+// Unit conversion + movement thresholds
+const MS_TO_KTS = 1.9438444924406;
+const TRAIL_MIN_KTS = 5;        // only draw trails when moving faster than this
+const LANDED_MAX_KTS = 10;      // optional: mark “landed” when under this
 
-const MAX_TRAIL_POINTS = 18; // tweak
-const MAX_TRAIL_AGE_MS = 2 * 60_000; // 2 min
-const MIN_MOVE_METERS = 25; // don’t add points unless it actually moved
+// Trail tuning
+const MAX_TRAIL_POINTS = 18;            // points per aircraft
+const MAX_TRAIL_AGE_MS = 2 * 60_000;    // discard points older than 2 min
+const MIN_MOVE_METERS = 25;             // ignore jitter unless it actually moved
 
-function metersBetween(a: { lat: number; lon: number }, b: { lat: number; lon: number }) {
+function metersBetween(
+  a: { lat: number; lon: number },
+  b: { lat: number; lon: number }
+) {
   const R = 6371000;
   const dLat = ((b.lat - a.lat) * Math.PI) / 180;
   const dLon = ((b.lon - a.lon) * Math.PI) / 180;
@@ -75,6 +81,73 @@ function metersBetween(a: { lat: number; lon: number }, b: { lat: number; lon: n
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
 
   return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+// Supports BOTH payload shapes:
+// - DB:   ground_speed_kt (number), on_ground (boolean)
+// - Live: velocity (m/s), onGround (boolean)
+function getKts(a: any): number | null {
+  if (typeof a?.ground_speed_kt === "number" && Number.isFinite(a.ground_speed_kt)) {
+    return a.ground_speed_kt;
+  }
+  if (typeof a?.velocity === "number" && Number.isFinite(a.velocity)) {
+    return a.velocity * MS_TO_KTS;
+  }
+  return null;
+}
+
+function getOnGround(a: any): boolean {
+  if (typeof a?.on_ground === "boolean") return a.on_ground;
+  return !!a?.onGround;
+}
+
+function getTrackDeg(a: any): number {
+  const v = a?.track;
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+// Update trailsRef.current in-place (call this inside your loadAircraft() after setAircraft(list))
+function updateTrails(trails: TrailMap, list: any[]) {
+  const now = Date.now();
+
+  // prune old points
+  for (const k of Object.keys(trails)) {
+    trails[k] = (trails[k] ?? []).filter((p) => now - p.t <= MAX_TRAIL_AGE_MS);
+    if (trails[k].length === 0) delete trails[k];
+  }
+
+  // add/append points
+  for (const a of list) {
+    const lat = a?.lat;
+    const lon = a?.lon;
+    if (typeof lat !== "number" || typeof lon !== "number") continue;
+
+    const key = (a?.icao24 ?? a?.callsign ?? "").toString();
+    if (!key) continue;
+
+    const kts = getKts(a) ?? 0;
+    const onGround = getOnGround(a);
+
+    // only collect trail points if moving and not on ground
+    if (onGround || kts < TRAIL_MIN_KTS) continue;
+
+    const arr = trails[key] ?? [];
+    const last = arr[arr.length - 1];
+
+    if (last) {
+      const moved = metersBetween({ lat: last.lat, lon: last.lon }, { lat, lon });
+      if (moved < MIN_MOVE_METERS) continue;
+    }
+
+    arr.push({ lat, lon, t: now });
+
+    // cap length
+    if (arr.length > MAX_TRAIL_POINTS) {
+      arr.splice(0, arr.length - MAX_TRAIL_POINTS);
+    }
+
+    trails[key] = arr;
+  }
 }
 
 /**
@@ -281,49 +354,14 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   }, [airportCode, layout]);
 
   // ---- update trails when aircraft list updates ----
-  useEffect(() => {
-    const now = Date.now();
+// ---- update trails when aircraft list updates ----
+useEffect(() => {
+  // This uses getKts/getOnGround so it works for BOTH payload shapes:
+  // - DB: ground_speed_kt + on_ground
+  // - OpenSky: velocity (m/s) + onGround
+  updateTrails(trailsRef.current, aircraft);
+}, [aircraft]);
 
-    for (const a of aircraft) {
-      const key = (a?.icao24 || a?.callsign || "").toString().trim();
-      if (!key) continue;
-
-      const lat = a?.lat;
-      const lon = a?.lon;
-      if (typeof lat !== "number" || typeof lon !== "number") continue;
-
-      const velMs = typeof a?.velocity === "number" ? a.velocity : 0;
-      const kts = velMs * MS_TO_KTS;
-
-      // Only maintain trails for moving aircraft
-      if (kts <= TRAIL_MIN_KTS) {
-        continue;
-      }
-
-      const prev = trailsRef.current[key] ?? [];
-      const last = prev[prev.length - 1];
-      const nextPoint: TrailPoint = { lat, lon, t: now };
-
-      if (!last || metersBetween({ lat: last.lat, lon: last.lon }, { lat, lon }) >= MIN_MOVE_METERS) {
-        trailsRef.current[key] = [...prev, nextPoint]
-          .filter((p) => now - p.t <= MAX_TRAIL_AGE_MS)
-          .slice(-MAX_TRAIL_POINTS);
-      } else {
-        // still prune old points
-        trailsRef.current[key] = prev.filter((p) => now - p.t <= MAX_TRAIL_AGE_MS);
-      }
-    }
-
-    // Cleanup trails not in current list
-    const liveKeys = new Set(
-      aircraft
-        .map((a) => (a?.icao24 || a?.callsign || "").toString().trim())
-        .filter(Boolean)
-    );
-    for (const k of Object.keys(trailsRef.current)) {
-      if (!liveKeys.has(k)) delete trailsRef.current[k];
-    }
-  }, [aircraft]);
 
   // ---- UI states ----
   if (loading && !layout) {
@@ -452,25 +490,21 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
   const key = (a?.icao24 ?? a?.callsign ?? `ac-${idx}`).toString();
   const callsign = (a?.callsign ?? a?.icao24 ?? "Aircraft").toString();
 
-  const velMs = typeof a?.velocity === "number" ? a.velocity : 0;
-  const kts = velMs * MS_TO_KTS;
-
-  const onGround = !!a?.onGround;
-  const track = typeof a?.track === "number" ? a.track : 0;
+  const kts = getKts(a);                 // ✅ works with DB + OpenSky payloads
+  const onGround = getOnGround(a);       // ✅ works with DB + OpenSky payloads
+  const track = getTrackDeg(a);          // ✅ safe
 
   const trail = trailsRef.current[key] ?? [];
-  const showTrail = kts > TRAIL_MIN_KTS && trail.length >= 2;
+  const showTrail = (kts ?? 0) > TRAIL_MIN_KTS && trail.length >= 2;
 
-  // Pick a better color scheme (tweak these anytime)
   const color = onGround
-    ? "rgba(168,85,247,0.95)"  // ground = purple
-    : "rgba(56,189,248,0.95)"; // air = blue
+    ? "rgba(168,85,247,0.95)"   // ground = purple
+    : "rgba(56,189,248,0.95)";  // air = blue
 
-  // Updated signature: makeAircraftIcon(trackDeg, color, onGround)
   const icon = makeAircraftIcon(track, color, onGround);
 
   return (
-    <div key={key}>
+    <>
       {showTrail && (
         <AnyPolyline
           positions={trail.map((p) => [p.lat, p.lon] as [number, number])}
@@ -481,13 +515,14 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
       <AnyMarker position={[lat, lon]} icon={icon}>
         <AnyTooltip direction="top" offset={[0, -6]}>
           {callsign}
-          {Number.isFinite(kts) ? ` • ${Math.round(kts)} kt` : ""}
+          {kts != null ? ` • ${Math.round(kts)} kt` : ""}
           {onGround ? " • GND" : ""}
         </AnyTooltip>
       </AnyMarker>
-    </div>
+    </>
   );
 })}
+
 
         {/* Taxi nodes */}
         {layout.taxiGraph?.map((node) => (
