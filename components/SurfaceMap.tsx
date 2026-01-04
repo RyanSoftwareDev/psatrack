@@ -13,6 +13,8 @@ import {
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { matchAircraftToGates } from "@/lib/gateMatching";
+import { Fragment } from "react";
+
 
 // Loosen the types so TS stops complaining in Next 16
 const AnyMapContainer = LeafletMapContainer as any;
@@ -487,16 +489,23 @@ useEffect(() => {
   const lon = a?.lon;
   if (typeof lat !== "number" || typeof lon !== "number") return null;
 
-  const key = (a?.icao24 ?? a?.callsign ?? `ac-${idx}`).toString();
-  const callsign = (a?.callsign ?? a?.icao24 ?? "Aircraft").toString();
+  // Always-unique key (icao24 preferred, otherwise callsign + idx)
+  const key =
+    typeof a?.icao24 === "string" && a.icao24.trim()
+      ? a.icao24.trim()
+      : `${String(a?.callsign || "unk").trim()}-${idx}`;
 
-  const kts = getKts(a);                 // ✅ works with DB + OpenSky payloads
-  const onGround = getOnGround(a);       // ✅ works with DB + OpenSky payloads
-  const track = getTrackDeg(a);          // ✅ safe
+  const callsign = String(a?.callsign ?? a?.icao24 ?? "Aircraft").trim();
+
+  // IMPORTANT: supports both DB + live payload shapes
+  const kts = getKts(a);                 // number | null (already in knots)
+  const onGround = getOnGround(a);       // boolean
+  const track = getTrackDeg(a);          // number (deg)
 
   const trail = trailsRef.current[key] ?? [];
   const showTrail = (kts ?? 0) > TRAIL_MIN_KTS && trail.length >= 2;
 
+  // Colors (tweak anytime)
   const color = onGround
     ? "rgba(168,85,247,0.95)"   // ground = purple
     : "rgba(56,189,248,0.95)";  // air = blue
@@ -504,7 +513,7 @@ useEffect(() => {
   const icon = makeAircraftIcon(track, color, onGround);
 
   return (
-    <>
+    <Fragment key={key}>
       {showTrail && (
         <AnyPolyline
           positions={trail.map((p) => [p.lat, p.lon] as [number, number])}
@@ -519,9 +528,10 @@ useEffect(() => {
           {onGround ? " • GND" : ""}
         </AnyTooltip>
       </AnyMarker>
-    </>
+    </Fragment>
   );
 })}
+
 
 
         {/* Taxi nodes */}
