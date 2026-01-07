@@ -1,6 +1,7 @@
 import { defineConfig, globalIgnores } from "eslint/config";
 import nextVitals from "eslint-config-next/core-web-vitals";
 import nextTs from "eslint-config-next/typescript";
+import { Analytics } from "@vercel/analytics/next"
 
 const eslintConfig = defineConfig([
   ...nextVitals,
