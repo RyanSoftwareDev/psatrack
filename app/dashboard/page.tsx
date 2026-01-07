@@ -88,7 +88,7 @@ export default function DashboardPage() {
   }
 
   loadOccupancy();
-  const t = setInterval(loadOccupancy, 15000);
+  const t = setInterval(loadOccupancy, 4500);
   return () => clearInterval(t);
 }, [currentBase, airport]);
 

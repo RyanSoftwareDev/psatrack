@@ -320,7 +320,7 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
         const code = airportCode.toUpperCase().trim();
 
         // NOTE: keep your radius as you like (you had 500)
-        const res = await fetch(`/api/aircraft/nearby/${code}?radiusNm=500`, {
+        const res = await fetch(`/api/aircraft/nearby/${code}?radiusNm=10000`, {
           cache: "no-store",
         });
         if (!res.ok) return;
@@ -347,7 +347,7 @@ export function SurfaceMap({ airportCode }: SurfaceMapProps) {
     }
 
     loadAircraft();
-    const t = setInterval(loadAircraft, 15000);
+    const t = setInterval(loadAircraft, 4500);
 
     return () => {
       cancelled = true;

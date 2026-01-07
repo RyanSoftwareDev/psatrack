@@ -15,7 +15,7 @@ const AIRPORTS: Record<string, { icao: string; lat: number; lon: number }> = {
   PHL: { icao: "KPHL", lat: 39.8744, lon: -75.2424 },
 };
 
-const DEFAULT_RADIUS_NM = 55;
+const DEFAULT_RADIUS_NM = 500;
 
 // --- “Best feel” thresholds (tune later) ---
 const MS_TO_KTS = 1.9438444924406;
